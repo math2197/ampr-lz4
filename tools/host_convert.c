@@ -1,5 +1,6 @@
 /* CLI host (macOS/Linux) para testar o núcleo de conversão AMPR. GPL-3.0.
- * uso: host_convert [-l nivel] [-w workers] [-f fakelib.sprx] [-c] [-x ms] <origem> <destino>
+ * uso: host_convert [-l nivel] [-w workers] [-f fakelib.sprx] [-k lista] [-c] [-x ms] <origem> <destino>
+ *   -k  regras extras de manter solto (ex.: .ucas,Content/Movies/)
  *   -c  só roda conv_check_source; -x  seta cancel após ms (teste) */
 #include "../src/convert.h"
 
@@ -40,20 +41,21 @@ int main(int argc, char **argv) {
   j.o.level = 9;
   j.o.workers = 4;
   int check_only = 0, ch, cancel_ms = -1;
-  while ((ch = getopt(argc, argv, "l:w:f:cx:")) != -1) {
+  while ((ch = getopt(argc, argv, "l:w:f:k:cx:")) != -1) {
     switch (ch) {
       case 'l': j.o.level = atoi(optarg); break;
       case 'w': j.o.workers = atoi(optarg); break;
       case 'f': j.o.fakelib_sprx = optarg; break;
+      case 'k': j.o.keep_loose = optarg; break;
       case 'c': check_only = 1; break;
       case 'x': cancel_ms = atoi(optarg); break; /* teste: cancela após N ms */
       default:
-        fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-c] <origem> [destino]\n", argv[0]);
+        fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-k lista] [-c] <origem> [destino]\n", argv[0]);
         return 2;
     }
   }
   if (argc - optind < (check_only ? 1 : 2)) {
-    fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-c] <origem> [destino]\n", argv[0]);
+    fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-k lista] [-c] <origem> [destino]\n", argv[0]);
     return 2;
   }
   j.o.src_dir = argv[optind];
@@ -84,6 +86,8 @@ int main(int argc, char **argv) {
   }
   pthread_join(th, NULL);
   double el = now_s() - t0;
+  printf("estimativa: engine=%s packed=%llu loose=%llu\n", conv_engine_name(atomic_load(&j.p.engine)),
+         (unsigned long long)atomic_load(&j.p.packed_bytes), (unsigned long long)atomic_load(&j.p.loose_bytes));
   uint64_t src = atomic_load(&j.p.src_bytes), out = atomic_load(&j.p.out_bytes);
   printf("resultado: rc=%d stage=%s tempo=%.2fs origem=%llu bytes saída=%llu bytes razão=%.2f%%%s%s\n", j.rc,
          stage_name(atomic_load(&j.p.stage)), el, (unsigned long long)src, (unsigned long long)out,

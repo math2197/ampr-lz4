@@ -6,6 +6,10 @@ e acrescenta as checagens do carregador C++ (ampr_emu_index.cpp / ampr_emu_pack_
 Python não faz. Por fim descomprime todos os arquivos pelo manifesto e compara SHA-256 com a origem.
 
 uso: python3 -I tests/validate_ampr.py <origem> <destino> [--fakelib caminho.sprx]
+         [--expect-loose REGRA ...] [--expect-packed REGRA ...]
+REGRA usa a mesma sintaxe de keep_loose: ".ucas" (extensão), "global.ucas" (nome) ou
+"Content/Paks/" (prefixo de caminho relativo, com '/'). Cada regra precisa casar ao menos um arquivo,
+e todos os que casam precisam estar soltos (ou empacotados) no destino.
 """
 from __future__ import annotations
 
@@ -89,6 +93,22 @@ def source_rows(src: Path, fakelib: Path | None) -> list[tuple[int, int, str]]:
         ok = bai.validate_and_add_row(rows, seen, st.st_size, int(st.st_mtime), "/app0/fakelib/libSceAmpr.sprx", False)
         check(ok, "colisão fakelib")
     return rows
+
+
+def rule_match(rel: str, rule: str) -> bool:
+    """Mesma semântica de scan_keep_loose_match (src/scan.c), para um único token."""
+    t = rule.strip()
+    if t.lower().startswith("/app0/"):
+        t = t[6:]
+    t = t.lstrip("/")
+    if not t:
+        return False
+    r, tl, base = rel.lower(), t.lower(), rel.rsplit("/", 1)[-1].lower()
+    if "/" in t:
+        return r.startswith(tl) and (len(r) == len(tl) or r[len(tl)] == "/" or tl.endswith("/"))
+    if t.startswith("."):
+        return base.endswith(tl)
+    return base == tl
 
 
 def check_idx3_like_cpp(data: bytes) -> None:
@@ -187,6 +207,8 @@ def main() -> int:
     ap.add_argument("src", type=Path)
     ap.add_argument("dst", type=Path)
     ap.add_argument("--fakelib", type=Path)
+    ap.add_argument("--expect-loose", action="append", default=[], metavar="REGRA")
+    ap.add_argument("--expect-packed", action="append", default=[], metavar="REGRA")
     a = ap.parse_args()
     src, dst = a.src.resolve(), a.dst.resolve()
 
@@ -227,6 +249,7 @@ def main() -> int:
     expected_on_disk: set[str] = set(OUTPUT_NAMES)
     expected_on_disk.update(m.pack_name(i) for i in range(len(m.packs)))
     packed = loose = 0
+    is_packed: dict[str, bool] = {}
     packed_bytes = loose_bytes = 0
     n_lz4 = sum(1 for c in m.chunks if c.codec == fmt.CHUNK_CODEC_LZ4)
     n_shared = sum(1 for c in m.chunks if c.flags & fmt.CHUNK_FLAG_SHARED)
@@ -238,6 +261,7 @@ def main() -> int:
             else:
                 srcf = src / rel
             want = sha256_file(srcf)
+            is_packed[rel] = bool(rec.flags & fmt.FILE_FLAG_PACKED)
             if rec.flags & fmt.FILE_FLAG_PACKED:
                 h = hashlib.sha256()
                 for raw in reader.iter_file_data(fid):
@@ -271,6 +295,18 @@ def main() -> int:
         for dn in dirnames:
             rel = (Path(dirpath) / dn).relative_to(src)
             check((dst / rel).is_dir(), f"diretório não recriado: {rel}")
+
+    # 5) regras esperadas: arquivos que precisam ficar soltos (lidos fora da API AMPR) ou empacotados
+    for rules, want_packed, label in ((a.expect_loose, False, "solto"), (a.expect_packed, True, "empacotado")):
+        for rule in rules:
+            hits = [r for r in is_packed if rule_match(r, rule)]
+            check(bool(hits), f"regra {rule!r} não casou nenhum arquivo")
+            bad = [r for r in hits if is_packed[r] != want_packed]
+            check(not bad, f"regra {rule!r}: esperado {label}, mas não está: {sorted(bad)[:10]}")
+            if not want_packed:
+                for r in hits:
+                    check((dst / r).is_file(), f"regra {rule!r}: {r} não está solto no destino")
+            print(f"regra {label} ok: {rule!r} ({len(hits)} arquivo(s))")
 
     src_total = sum(r[0] for r in rows)
     dst_total = sum((dst / p).stat().st_size for p in actual)

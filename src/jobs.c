@@ -5,6 +5,9 @@
 #include "platform.h"
 #include "smp.h"
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,11 +21,20 @@
 #define AMPR_EMBED_SPRX_DIR "/data/ampr-lz4"
 #define AMPR_SPRX_MAGIC "AMPRPAK4" /* formato de pacote que o núcleo gera */
 #define HMAX 10
+#define EMAX 64
+
+/* TODO(integração): o outro branch adiciona `char keep_loose[256]` em g_cfg (platform.h, chave
+ * keep_loose= do config.ini). No merge, trocar CFG_KEEP_LOOSE() por g_cfg.keep_loose e apagar este bloco. */
+#ifndef CFG_KEEP_LOOSE
+#define CFG_KEEP_LOOSE() ""
+#endif
 
 typedef struct {
   int job;
   char id[16], title[128], dest_drive[8];
   int level;
+  int delete_source;          /* apagar a imagem original após sucesso verificado */
+  char keep_loose[256];       /* regras extras do pedido (já validadas pelo httpd) */
 } jobreq_t;
 
 typedef struct {
@@ -32,6 +44,10 @@ typedef struct {
   char error[256];
   uint64_t src_bytes, out_bytes;
   int seconds;
+  int engine;                 /* conv_engine_t; -1 = não chegou ao fim do SCAN */
+  int source_deleted;
+  uint64_t freed_bytes;
+  char warning[256];          /* ex.: "original mantido: ..." */
 } hist_t;
 
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -40,6 +56,9 @@ static jobreq_t queue[QMAX];
 static int qn, next_job = 1;
 static hist_t hist[HMAX];
 static int hn;                       /* total já escrito (anel) */
+/* engine já detectada por jogo (para /api/games), em memória */
+static struct { char id[16]; int engine; } eng_known[EMAX];
+static int eng_n;
 
 static int cur_active;
 static jobreq_t cur;
@@ -154,9 +173,113 @@ static void set_stage(int s) {
   pthread_mutex_unlock(&mu);
 }
 
+static void remember_engine_locked(const char *id, int engine) {
+  int i;
+  for (i = 0; i < eng_n; i++) if (!strcmp(eng_known[i].id, id)) break;
+  if (i == eng_n) {
+    if (eng_n < EMAX) eng_n++;
+    else { memmove(&eng_known[0], &eng_known[1], (EMAX - 1) * sizeof eng_known[0]); i = EMAX - 1; }
+    snprintf(eng_known[i].id, sizeof eng_known[i].id, "%s", id);
+  }
+  eng_known[i].engine = engine;
+}
+
+const char *jobs_engine_of(const char *id) {
+  const char *r = NULL;
+  pthread_mutex_lock(&mu);
+  for (int i = 0; i < eng_n; i++) if (!strcmp(eng_known[i].id, id)) r = conv_engine_name(eng_known[i].engine);
+  if (!r && cur_valid && !strcmp(cur.id, id) &&
+      atomic_load(&prog.packed_bytes) + atomic_load(&prog.loose_bytes) > 0)
+    r = conv_engine_name(atomic_load(&prog.engine));
+  pthread_mutex_unlock(&mu);
+  return r;
+}
+
+/* Junta as regras do config.ini e do pedido ("a,b"). */
+static void merge_keep_loose(char *out, size_t n, const char *cfg, const char *req) {
+  snprintf(out, n, "%s%s%s", cfg ? cfg : "", (cfg && *cfg && req && *req) ? "," : "", req ? req : "");
+}
+
+static int ends_ci(const char *s, const char *suf) {
+  size_t a = strlen(s), b = strlen(suf);
+  return a >= b && strcasecmp(s + a - b, suf) == 0;
+}
+
+/* realpath de prefixo+abs, ou "" se não existir. */
+static void real_of(char *out, const char *abs) {
+  char tmp[PATH_MAX];
+  plat_path(tmp, sizeof tmp, abs);
+  if (!realpath(tmp, out)) out[0] = 0;
+}
+
+static int under_dir(const char *path, const char *dir) {
+  size_t l = strlen(dir);
+  return l && !strncmp(path, dir, l) && path[l] == '/';
+}
+
+/* 1 se rp (realpath) está sob /data/ ou /mnt/extN/ (com o prefixo de host). */
+static int allowed_root(const char *rp) {
+  char data[PATH_MAX], mnt[PATH_MAX];
+  real_of(data, "/data");
+  if (data[0] && under_dir(rp, data)) return 1;
+  real_of(mnt, "/mnt");
+  if (!mnt[0] || !under_dir(rp, mnt)) return 0;
+  const char *q = rp + strlen(mnt) + 1;
+  if (strncmp(q, "ext", 3)) return 0;
+  q += 3;
+  if (*q < '0' || *q > '9') return 0;
+  while (*q >= '0' && *q <= '9') q++;
+  return *q == '/';
+}
+
+static void fsync_parent(const char *path) {
+  char d[PATH_MAX];
+  snprintf(d, sizeof d, "%s", path);
+  char *sl = strrchr(d, '/');
+  if (!sl) return;
+  if (sl == d) sl[1] = 0; else *sl = 0;
+  int fd = open(d, O_RDONLY);
+  if (fd >= 0) { (void)fsync(fd); close(fd); }
+}
+
+/* Apaga a imagem original (img = caminho lógico vindo do SMP no início do job). Pré-condição: conversão
+ * concluída e verificada e imagem desmontada. Retorna 0 se apagou (*freed = tamanho); senão -1 com o
+ * motivo em why. Nunca apaga diretório, symlink, nada fora de /data/ ou /mnt/extN/, nem o destino. */
+static int delete_source_image(const char *id, const char *img, const char *dst, uint64_t *freed, char *why, size_t wn) {
+  char real[PATH_MAX], rp[PATH_MAX], drp[PATH_MAX], e[128] = "";
+  struct stat st;
+  *freed = 0;
+  if (!img[0]) { snprintf(why, wn, "caminho da imagem desconhecido"); return -1; }
+  if (!ends_ci(img, ".exfat") && !ends_ci(img, ".ffpfsc")) { snprintf(why, wn, "não é imagem .exfat/.ffpfsc"); return -1; }
+  {
+    smp_game_t gi;
+    memset(&gi, 0, sizeof gi);
+    if (smp_game_info(id, &gi, e, sizeof e) != 0) { snprintf(why, wn, "SMP não confirmou o desmonte (%s)", e); return -1; }
+    if (gi.mounted || gi.runtime_path[0]) { snprintf(why, wn, "a imagem ainda consta como montada"); return -1; }
+    if (strcmp(gi.path, img)) { snprintf(why, wn, "o caminho da imagem mudou no SMP"); return -1; }
+  }
+  plat_path(real, sizeof real, img);
+  if (lstat(real, &st) != 0) { snprintf(why, wn, "imagem não encontrada"); return -1; }
+  if (S_ISLNK(st.st_mode)) { snprintf(why, wn, "a imagem é um symlink"); return -1; }
+  if (!S_ISREG(st.st_mode)) { snprintf(why, wn, "a imagem não é um arquivo regular"); return -1; }
+  if (!realpath(real, rp)) { snprintf(why, wn, "realpath falhou: %s", strerror(errno)); return -1; }
+  if (!ends_ci(rp, ".exfat") && !ends_ci(rp, ".ffpfsc")) { snprintf(why, wn, "caminho real não é .exfat/.ffpfsc"); return -1; }
+  if (!allowed_root(rp)) { snprintf(why, wn, "imagem fora de /data/ e /mnt/extN/"); return -1; }
+  if (!realpath(dst, drp)) { snprintf(why, wn, "destino não encontrado"); return -1; }
+  if (!strcmp(rp, drp) || under_dir(rp, drp)) { snprintf(why, wn, "origem e destino coincidem"); return -1; }
+  if (lstat(rp, &st) != 0 || !S_ISREG(st.st_mode)) { snprintf(why, wn, "a imagem não é um arquivo regular"); return -1; }
+  if (unlink(rp) != 0) { snprintf(why, wn, "unlink falhou: %s", strerror(errno)); return -1; }
+  fsync_parent(rp);
+  *freed = (uint64_t)st.st_size;
+  alog("job: imagem original apagada: %s (%s), %llu bytes liberados", img, rp, (unsigned long long)*freed);
+  return 0;
+}
+
 static void run_job(const jobreq_t *r) {
   char err[256] = "", runtime[512] = "", why[200] = "", dst[640], hb[600], root_real[400], logical[300];
-  int ok = 0, mounted = 0, cancelled = 0;
+  char img_path[512] = "", warning[256] = "";
+  int ok = 0, mounted = 0, cancelled = 0, deleted = 0;
+  uint64_t freed = 0;
 
   pthread_mutex_lock(&mu);
   cur = *r;
@@ -186,7 +309,9 @@ static void run_job(const jobreq_t *r) {
     /* Se o SMP já mantém a imagem montada (jogo pronto para iniciar), reaproveita e não desmonta no fim. */
     smp_game_t gi;
     memset(&gi, 0, sizeof gi);
-    if (smp_game_info(r->id, &gi, NULL, 0) == 0 && gi.mounted && gi.runtime_path[0]) {
+    int have = smp_game_info(r->id, &gi, NULL, 0) == 0;
+    if (have) snprintf(img_path, sizeof img_path, "%s", gi.path);
+    if (have && gi.mounted && gi.runtime_path[0]) {
       snprintf(runtime, sizeof runtime, "%s", gi.runtime_path);
     } else {
       if (smp_mount(r->id, runtime, sizeof runtime, err, sizeof err)) goto out;
@@ -202,7 +327,10 @@ static void run_job(const jobreq_t *r) {
 
   char sprx[512];
   if (choose_sprx(sprx, sizeof sprx, err, sizeof err) != 0) goto out;
-  conv_opts_t o = {runtime, dst, sprx, r->level, g_cfg.workers};
+  char keep[600];
+  merge_keep_loose(keep, sizeof keep, CFG_KEEP_LOOSE(), r->keep_loose);
+  if (keep[0]) alog("job: keep_loose=%s", keep);
+  conv_opts_t o = {runtime, dst, sprx, r->level, g_cfg.workers, keep[0] ? keep : NULL};
   atomic_store(&prog.stage, CONV_STAGE_SCAN);
   int rc = conv_run(&o, &prog);
   if (rc == 0) ok = 1;
@@ -218,6 +346,23 @@ out:
       if (smp_set_fakelib(r->id, "emulators", e2, sizeof e2)) conv_notify("AMPR-LZ4: aviso, fakelib não ajustado (%s)", e2);
     }
   }
+  if (ok && r->delete_source) {
+    /* Só com sucesso verificado: conv_run publica ampr_assets.index depois da etapa VERIFY. */
+    char man[700], e3[128] = "";
+    struct stat mst;
+    snprintf(man, sizeof man, "%s/ampr_assets.index", dst);
+    if (stat(man, &mst) != 0 || !S_ISREG(mst.st_mode))
+      snprintf(warning, sizeof warning, "original mantido: ampr_assets.index não publicado");
+    else if (smp_unmount(r->id, e3, sizeof e3) != 0) /* desmonta mesmo se o SMP já mantinha montada */
+      snprintf(warning, sizeof warning, "original mantido: falha ao desmontar (%s)", e3);
+    else {
+      char w2[200];
+      mounted = 0;
+      if (delete_source_image(r->id, img_path, dst, &freed, w2, sizeof w2) == 0) deleted = 1;
+      else snprintf(warning, sizeof warning, "original mantido: %s", w2);
+    }
+    if (warning[0]) alog("job: %s", warning);
+  }
   if (mounted) {
     char e3[128];
     if (smp_unmount(r->id, e3, sizeof e3)) conv_notify("AMPR-LZ4: aviso, falha ao desmontar (%s)", e3);
@@ -228,7 +373,15 @@ out:
   if (ok) {
     char a[32], b[32];
     fmt_gb(a, sizeof a, src); fmt_gb(b, sizeof b, outb);
-    conv_notify("AMPR-LZ4: %s concluído: %s -> %s (%.0f%%)", r->title[0] ? r->title : r->id, a, b, src ? 100.0 * (double)outb / (double)src : 0.0);
+    if (deleted) {
+      char c[32];
+      fmt_gb(c, sizeof c, freed);
+      conv_notify("AMPR-LZ4: %s concluído: %s -> %s, original apagado (%s liberados)", r->title[0] ? r->title : r->id, a, b, c);
+    } else if (warning[0]) {
+      conv_notify("AMPR-LZ4: %s concluído: %s -> %s; %s", r->title[0] ? r->title : r->id, a, b, warning);
+    } else {
+      conv_notify("AMPR-LZ4: %s concluído: %s -> %s (%.0f%%)", r->title[0] ? r->title : r->id, a, b, src ? 100.0 * (double)outb / (double)src : 0.0);
+    }
   } else if (final == CONV_STAGE_ERROR) conv_notify("AMPR-LZ4: erro em %s: %s", r->id, err);
   else conv_notify("AMPR-LZ4: %s cancelado", r->id);
 
@@ -243,6 +396,11 @@ out:
   snprintf(h->error, sizeof h->error, "%s", err);
   h->src_bytes = src; h->out_bytes = outb;
   h->seconds = (int)(time(NULL) - cur_start);
+  h->engine = atomic_load(&prog.packed_bytes) + atomic_load(&prog.loose_bytes) > 0 ? atomic_load(&prog.engine) : -1;
+  if (h->engine >= 0) remember_engine_locked(r->id, h->engine);
+  h->source_deleted = deleted;
+  h->freed_bytes = freed;
+  snprintf(h->warning, sizeof h->warning, "%s", warning);
   atomic_store(&prog.stage, final);
   if (!ok && final == CONV_STAGE_ERROR) snprintf(prog.error, sizeof prog.error, "%s", err);
   cur_finished = 1;
@@ -284,7 +442,8 @@ int jobs_init(void) {
   return rc;
 }
 
-int jobs_enqueue(const char *id, const char *title, const char *drive, int level, char *err, size_t en) {
+int jobs_enqueue(const char *id, const char *title, const char *drive, int level, const char *keep_loose,
+                 int delete_source, char *err, size_t en) {
   pthread_mutex_lock(&mu);
   int dup = cur_active && !strcmp(cur.id, id);
   for (int i = 0; i < qn; i++) if (!strcmp(queue[i].id, id)) dup = 1;
@@ -297,6 +456,8 @@ int jobs_enqueue(const char *id, const char *title, const char *drive, int level
   snprintf(r->title, sizeof r->title, "%s", title);
   snprintf(r->dest_drive, sizeof r->dest_drive, "%s", drive);
   r->level = level;
+  r->delete_source = delete_source ? 1 : 0;
+  snprintf(r->keep_loose, sizeof r->keep_loose, "%s", keep_loose ? keep_loose : "");
   int j = r->job;
   pthread_cond_signal(&cv);
   pthread_mutex_unlock(&mu);
@@ -319,6 +480,7 @@ int jobs_cancel(int job) {
         snprintf(h->id, sizeof h->id, "%s", queue[i].id);
         snprintf(h->title, sizeof h->title, "%s", queue[i].title);
         h->result = "cancelled";
+        h->engine = -1;
         memmove(&queue[i], &queue[i + 1], (size_t)(qn - i - 1) * sizeof queue[0]);
         qn--;
         rc = 0;
@@ -353,13 +515,25 @@ void jobs_status_json(sb_t *b) {
               stage_name(st), (unsigned long long)done, (unsigned long long)total,
               (unsigned long long)atomic_load(&prog.src_bytes), (unsigned long long)atomic_load(&prog.out_bytes), cur_active ? speed_ema : 0.0, cur_active ? eta : 0LL);
     sb_json_str(b, st == CONV_STAGE_ERROR ? prog.error : "");
+    {
+      uint64_t pk = atomic_load(&prog.packed_bytes), lo = atomic_load(&prog.loose_bytes);
+      /* engine só é conhecida depois do SCAN (packed+loose > 0) */
+      sb_puts(b, ",\"engine\":");
+      if (pk + lo > 0) sb_json_str(b, conv_engine_name(atomic_load(&prog.engine)));
+      else sb_puts(b, "null");
+      sb_printf(b, ",\"packed_bytes\":%llu,\"loose_bytes\":%llu,\"delete_source\":%s", (unsigned long long)pk,
+                (unsigned long long)lo, cur.delete_source ? "true" : "false");
+    }
     sb_puts(b, "}");
   }
   sb_puts(b, ",\"queue\":[");
   for (int i = 0; i < qn; i++) {
     sb_printf(b, "%s{\"job\":%d,\"id\":", i ? "," : "", queue[i].job); sb_json_str(b, queue[i].id);
     sb_puts(b, ",\"title\":"); sb_json_str(b, queue[i].title);
-    sb_printf(b, ",\"dest_drive\":\"%s\",\"level\":%d}", queue[i].dest_drive, queue[i].level);
+    sb_printf(b, ",\"dest_drive\":\"%s\",\"level\":%d,\"delete_source\":%s,\"keep_loose\":", queue[i].dest_drive,
+              queue[i].level, queue[i].delete_source ? "true" : "false");
+    sb_json_str(b, queue[i].keep_loose);
+    sb_puts(b, "}");
   }
   sb_puts(b, "],\"history\":[");
   int cnt = hn < HMAX ? hn : HMAX;
@@ -370,6 +544,12 @@ void jobs_status_json(sb_t *b) {
     sb_printf(b, ",\"result\":\"%s\",\"src_bytes\":%llu,\"out_bytes\":%llu,\"seconds\":%d,\"error\":", h->result,
               (unsigned long long)h->src_bytes, (unsigned long long)h->out_bytes, h->seconds);
     sb_json_str(b, h->error);
+    sb_puts(b, ",\"engine\":");
+    if (h->engine >= 0) sb_json_str(b, conv_engine_name(h->engine));
+    else sb_puts(b, "null");
+    sb_printf(b, ",\"source_deleted\":%s,\"freed_bytes\":%llu,\"warning\":", h->source_deleted ? "true" : "false",
+              (unsigned long long)h->freed_bytes);
+    sb_json_str(b, h->warning);
     sb_puts(b, "}");
   }
   sb_puts(b, "]}");

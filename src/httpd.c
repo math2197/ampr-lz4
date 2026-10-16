@@ -158,6 +158,12 @@ static void api_games(req_t *q) {
     sb_printf(&b, ",\"format\":\"%s\",\"drive\":\"%s\",\"image_path\":", fmt, drive); sb_json_str(&b, g[i].path);
     sb_printf(&b, ",\"size_bytes\":%llu,\"converted\":%s,\"compatible\":null,\"dest_path\":", (unsigned long long)g[i].size, cd ? "true" : "false");
     sb_json_str(&b, dest);
+    {
+      const char *eng = jobs_engine_of(g[i].title_id); /* conhecida só depois de um SCAN nesta sessão */
+      sb_puts(&b, ",\"engine\":");
+      if (eng) sb_json_str(&b, eng);
+      else sb_puts(&b, "null");
+    }
     sb_puts(&b, "}");
   }
   sb_puts(&b, "]}");
@@ -194,12 +200,31 @@ static void api_info(req_t *q) {
   sb_free(&b);
 }
 
+/* keep_loose: até 255 caracteres de [A-Za-z0-9._/,-]. */
+static int valid_keep_loose(const char *s) {
+  size_t n = strlen(s);
+  if (n > 255) return 0;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+          c == '/' || c == ',' || c == '-'))
+      return 0;
+  }
+  return 1;
+}
+
 static void api_convert(req_t *q, const char *body) {
-  char id[32] = "", drive[16] = "";
+  char id[32] = "", drive[16] = "", keep[512] = "";
   long long level = g_cfg.level;
+  int del = 0;
   if (json_get_str(body, "id", id, sizeof id) || !valid_id(id)) { respond_err(q, 400, "id inválido"); return; }
   if (json_get_str(body, "dest_drive", drive, sizeof drive) || !plat_drive_root(drive)) { respond_err(q, 400, "dest_drive inválido (data|ext0|ext1)"); return; }
   if (json_get(body, "level") && (json_get_int(body, "level", &level) || level < 1 || level > 12)) { respond_err(q, 400, "level deve ser 1..12"); return; }
+  if (json_get(body, "keep_loose") && (json_get_str(body, "keep_loose", keep, sizeof keep) || !valid_keep_loose(keep))) {
+    respond_err(q, 400, "keep_loose: até 255 caracteres de A-Z a-z 0-9 . _ / , -");
+    return;
+  }
+  if (json_get(body, "delete_source") && json_get_bool(body, "delete_source", &del)) { respond_err(q, 400, "delete_source deve ser true ou false"); return; }
   smp_game_t *g; int n; char err[256];
   if (smp_list_games(&g, &n, err, sizeof err)) { respond_err(q, 503, err); return; }
   const char *title = NULL; char tbuf[128] = "";
@@ -209,7 +234,7 @@ static void api_convert(req_t *q, const char *body) {
   }
   free(g);
   if (!title) { respond_err(q, 404, "jogo não encontrado"); return; }
-  int j = jobs_enqueue(id, title, drive, (int)level, err, sizeof err);
+  int j = jobs_enqueue(id, title, drive, (int)level, keep, del, err, sizeof err);
   if (j < 0) { respond_err(q, 409, err); return; }
   char out[64];
   snprintf(out, sizeof out, "{\"ok\":true,\"job\":%d}", j);

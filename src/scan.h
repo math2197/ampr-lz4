@@ -2,6 +2,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "convert.h"
 
 enum { SCAN_ACT_PACK = 0, SCAN_ACT_LOOSE = 1 };
 
@@ -27,12 +28,27 @@ typedef struct {
   size_t n_dirs;
   uint64_t total_bytes; /* soma dos tamanhos de todos os arquivos copiados/empacotados */
   size_t n_indexed;
+  int engine;           /* conv_engine_t detectado */
+  uint64_t packed_bytes;/* estimativa: soma dos PACK indexados (antes do auto-loose) */
+  uint64_t loose_bytes; /* total_bytes - packed_bytes */
 } scan_result_t;
 
 /* Varre src_dir recursivamente (sem seguir symlinks: symlink = erro).
  * fakelib_sprx != NULL: inclui/substitui fakelib/libSceAmpr.sprx (loose) lendo desse caminho.
  * Retorna 0 ou -1 com mensagem em err. */
 int scan_tree(const char *src_dir, const char *fakelib_sprx, scan_result_t *out, char *err, size_t errlen);
+/* Igual a scan_tree, aplicando também as regras extras keep_loose (ver conv_opts_t.keep_loose). */
+int scan_tree_ex(const char *src_dir, const char *fakelib_sprx, const char *keep_loose, scan_result_t *out, char *err,
+                 size_t errlen);
+/* Publica engine/packed_bytes/loose_bytes da varredura em p (estimativa exibida pela plataforma). */
+void scan_publish_estimate(const scan_result_t *r, conv_progress_t *p);
+
+/* Detecta a engine pelos caminhos relativos da lista (CONV_ENGINE_*). */
+int scan_detect_engine(const scan_file_t *files, size_t n);
+/* Perfil da engine + keep_loose: muda PACK->LOOSE onde preciso (só em arquivos PACK). */
+void scan_apply_rules(scan_result_t *r, const char *keep_loose);
+/* 1 se rel casa com alguma regra da lista keep_loose (extensão, nome ou prefixo de caminho). */
+int scan_keep_loose_match(const char *rel, const char *keep_loose);
 void scan_free(scan_result_t *r);
 
 /* Classificação estática de um caminho relativo (sem amostragem). Preenche action/exec/block_shift/reason. */

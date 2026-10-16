@@ -32,6 +32,8 @@ $(BUILD)/test_hashes: test_hashes.c $(CORE_OBJ)
 test: all
 	./$(BUILD)/test_hashes
 	python3 -I run_e2e.py
+	$(MAKE) -C $(ROOT) host
+	python3 -I run_delete_source.py
 
 # Só compila os objetos com o toolchain do PS5 (sem linkar).
 PS5_SDK ?= $(HOME)/ps5-payload-sdk

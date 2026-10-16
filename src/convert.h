@@ -17,6 +17,24 @@ typedef enum {
   CONV_STAGE_CANCELLED
 } conv_stage_t;
 
+/* Engine detectada na varredura (perfil de classificação loose/pack). */
+typedef enum {
+  CONV_ENGINE_UNKNOWN = 0,
+  CONV_ENGINE_UNREAL,      /* .utoc/.ucas ou .pak em .../Paks/ */
+  CONV_ENGINE_UNITY,       /* Media/ com .assets/.resS, ou globalgamemanagers */
+  CONV_ENGINE_NORTHLIGHT   /* .rmdtoc (Remedy: Control, Alan Wake 2) */
+} conv_engine_t;
+
+/* Nome estável (API/JSON) da engine: "unknown", "unreal", "unity", "northlight". */
+static inline const char *conv_engine_name(int e) {
+  switch (e) {
+    case CONV_ENGINE_UNREAL: return "unreal";
+    case CONV_ENGINE_UNITY: return "unity";
+    case CONV_ENGINE_NORTHLIGHT: return "northlight";
+    default: return "unknown";
+  }
+}
+
 typedef struct {
   _Atomic int      stage;          /* conv_stage_t */
   _Atomic uint64_t bytes_total;    /* bytes lógicos a processar na etapa atual */
@@ -24,6 +42,10 @@ typedef struct {
   _Atomic uint64_t src_bytes;      /* tamanho total da origem (lógico) */
   _Atomic uint64_t out_bytes;      /* tamanho final no destino */
   _Atomic int      cancel;         /* plataforma seta 1 para cancelar */
+  /* Estimativa publicada ao fim do SCAN (antes do auto-loose da etapa PACK). */
+  _Atomic int      engine;         /* conv_engine_t */
+  _Atomic uint64_t packed_bytes;   /* bytes lógicos destinados aos volumes .pak */
+  _Atomic uint64_t loose_bytes;    /* bytes lógicos copiados soltos */
   char             error[256];     /* mensagem quando stage == ERROR */
 } conv_progress_t;
 
@@ -33,6 +55,10 @@ typedef struct {
   const char *fakelib_sprx; /* caminho do libSceAmpr.sprx a copiar para fakelib/, ou NULL */
   int         level;        /* LZ4: 1..12 (1-4 fast, 5-12 HC) */
   int         workers;      /* 1..16 */
+  /* Regras extras de "manter solto", além do perfil da engine (NULL/"" = nenhuma). Lista separada por
+   * vírgulas, sem distinção de maiúsculas: ".ucas" (extensão), "global.ucas" (nome do arquivo) ou
+   * "Content/Paks/global.ucas" / "Content/Movies/" (prefixo do caminho relativo, contém '/'). */
+  const char *keep_loose;
 } conv_opts_t;
 
 /* Checa se o jogo em src_dir importa libSceAmpr e não é AMPR já convertido.

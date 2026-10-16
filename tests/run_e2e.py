@@ -57,6 +57,74 @@ def make_game(root: Path, big: bool) -> None:
         w(root, "Data/huge_text.big", text_blob(rng, 1 << 20) * 66)
 
 
+def make_base(root: Path, seed: int) -> random.Random:
+    rng = random.Random(seed)
+    w(root, "eboot.bin", b"\x7fELF" + b"\0" * 1000 + b"libSceAmpr.sprx\0" + os.urandom(5000))
+    w(root, "sce_sys/param.json", b'{"titleId":"PPSA00001"}')
+    return rng
+
+
+def make_unreal(root: Path) -> None:
+    """Árvore estilo Unreal (IoStore): .ucas compressível, que sem o perfil iria para os pacotes."""
+    rng = make_base(root, 99)
+    w(root, "Game/Content/Paks/pakchunk0-ps5.pak", text_blob(rng, 50000))
+    w(root, "Game/Content/Paks/pakchunk0-ps5.utoc", text_blob(rng, 20000))
+    w(root, "Game/Content/Paks/pakchunk0-ps5.ucas", text_blob(rng, 300000))
+    w(root, "Game/Content/Paks/pakchunk0-ps5.sig", text_blob(rng, 3000))
+    w(root, "Engine/Content/Paks/global.ucas", text_blob(rng, 200000))
+    w(root, "Engine/Content/Paks/global.utoc", text_blob(rng, 9000))
+    w(root, "Game/Content/Movies/intro.dat2", text_blob(rng, 120000))   # empacotado
+    w(root, "Game/Config/DefaultGame.ini", text_blob(rng, 40000))       # empacotado
+
+
+def make_northlight(root: Path) -> None:
+    rng = make_base(root, 77)
+    w(root, "data/ep100.rmdtoc", text_blob(rng, 80000))
+    w(root, "data/ep100-000.rmdp", text_blob(rng, 250000))             # empacotado
+    w(root, "data/streaming.rmdtoc", text_blob(rng, 30000))
+
+
+def make_unity(root: Path) -> None:
+    rng = make_base(root, 55)
+    w(root, "Media/Data/globalgamemanagers", text_blob(rng, 60000))
+    w(root, "Media/Data/sharedassets0.assets", text_blob(rng, 90000))
+    w(root, "Media/Data/sharedassets0.resS", text_blob(rng, 90000))
+
+
+def estimate(out: str) -> tuple[str, int, int]:
+    for line in out.splitlines():
+        if line.startswith("estimativa: "):
+            kv = dict(x.split("=", 1) for x in line[len("estimativa: "):].split())
+            return kv["engine"], int(kv["packed"]), int(kv["loose"])
+    raise SystemExit("host_convert não imprimiu a estimativa:\n" + out)
+
+
+def src_total(out: str) -> int:
+    line = out.strip().splitlines()[-1]
+    return int(line.split("origem=")[1].split()[0])
+
+
+def profile_case(t: Path, name: str, maker, expect_engine: str, loose: list[str], packed: list[str],
+                 keep: str | None = None) -> None:
+    src = t / f"{name}-src"
+    maker(src)
+    dst = t / f"{name}-out"
+    cmd = [str(CONV), "-l", "5", "-w", "2"] + (["-k", keep] if keep is not None else []) + [str(src), str(dst)]
+    out = run(cmd)
+    eng, pk, lo = estimate(out)
+    assert eng == expect_engine, (name, eng, expect_engine)
+    assert pk + lo == src_total(out), (name, pk, lo, src_total(out))
+    args = [sys.executable, "-I", str(VALIDATE), str(src), str(dst)]
+    for r in loose:
+        args += ["--expect-loose", r]
+    for r in packed:
+        args += ["--expect-packed", r]
+    vout = run(args)
+    assert "VALIDAÇÃO OK" in vout, vout
+    print(f"perfil {name}: engine={eng} packed={pk} B loose={lo} B; "
+          f"soltos {loose}, empacotados {packed}: VALIDAÇÃO OK")
+
+
 def idx_sizes(path: Path) -> dict[str, int]:
     """Lê o AMPRIDX3 (ampr_emu.index): {caminho /app0/... em minúsculas: tamanho}."""
     data = path.read_bytes()
@@ -168,6 +236,20 @@ def main() -> int:
         key = "/app0/fakelib/libsceampr.sprx"
         assert sizes.get(key) == len(got) != len(old_sprx), (sizes.get(key), len(got), len(old_sprx))
         print(f"fakelib antigo substituído: destino tem o sprx novo ({len(got)} bytes no índice), libSceAgc copiado")
+        # perfis por engine e regras extras (keep_loose)
+        profile_case(t, "unreal", make_unreal, "unreal",
+                     [".ucas", ".utoc", ".pak", "Game/Content/Paks/", "Engine/Content/Paks/global.ucas"],
+                     ["Game/Content/Movies/intro.dat2", "Game/Config/DefaultGame.ini"])
+        profile_case(t, "northlight", make_northlight, "northlight", [".rmdtoc"], [".rmdp"])
+        profile_case(t, "unity", make_unity, "unity", [], [".assets", ".resS", "globalgamemanagers"])
+        profile_case(t, "keep", lambda r: make_game(r, False), "unknown",
+                     [".res", "Mixed/", "exact.bin2", "Data/Level1.ARC"], ["Data/random.arc", "Data/tiny.cfg"],
+                     keep=" .RES , mixed/,EXACT.bin2,/app0/data/level1.arc")
+        profile_case(t, "keep-unreal", make_unreal, "unreal", [".ucas", "Game/Config/"],
+                     ["Game/Content/Movies/intro.dat2"], keep="Game/Config/")
+        # sem regra, .res e Level1.ARC iriam para os pacotes (garante que o caso keep_loose testa algo)
+        profile_case(t, "keep-none", lambda r: make_game(r, False), "unknown", [],
+                     ["dup_a.res", "Data/Level1.ARC", "Mixed/"])
     print("E2E OK")
     return 0
 

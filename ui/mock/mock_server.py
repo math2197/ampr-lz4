@@ -17,7 +17,10 @@ GAMES = [
 ]
 STAGES = ["mount", "scan", "pack", "copy", "verify", "finish"]
 lock = threading.Lock()
-state = {"cur": None, "queue": [], "hist": [], "n": 0, "converted": {"g5"}}
+state = {"cur": None, "queue": [], "hist": [], "n": 0, "converted": {"g5"}, "engine": {"g5": "unity"}}
+# engine simulada e fração empacotada por jogo (g7: quase tudo solto, mostra o aviso)
+ENG = {"g1": ("unreal", 0.55), "g2": ("unreal", 0.6), "g3": ("unknown", 0.9), "g4": ("unity", 0.8),
+       "g6": ("unknown", 0.9), "g7": ("northlight", 0.05), "g8": ("unity", 0.85)}
 
 def png(r, g, b, n=64):
     raw = b''.join(b'\x00' + bytes(v for x in range(n) for v in (min(255, int(r + x * 2)), int(g * (1 - y / n)), int(b))) for y in range(n))
@@ -32,7 +35,8 @@ def worker():
             if c is None:
                 if state["queue"]:
                     j = state["queue"].pop(0)
-                    state["cur"] = c = dict(j, stage="mount", bytes_done=0, bytes_total=j["src"], src_bytes=0, out_bytes=0, speed_bps=0, eta_s=0, error="", t=0, cancel=False)
+                    state["cur"] = c = dict(j, stage="mount", bytes_done=0, bytes_total=j["src"], src_bytes=0, out_bytes=0, speed_bps=0, eta_s=0, error="", t=0, cancel=False,
+                                            engine=None, packed_bytes=0, loose_bytes=0)
                 else: continue
             if c["cancel"]:
                 finish(c, "cancelled"); continue
@@ -44,14 +48,20 @@ def worker():
             c["bytes_done"] = int(c["src"] * min(1, t / 48))
             c["speed_bps"] = 350 * 1048576
             c["eta_s"] = (48 - t) * 20
+            if idx >= 2:
+                e, frac = ENG.get(c["id"], ("unknown", 0.8))
+                c["engine"] = e; c["packed_bytes"] = int(c["src"] * frac); c["loose_bytes"] = c["src"] - c["packed_bytes"]
             if idx >= 2: c["src_bytes"] = c["src"]; c["out_bytes"] = int(c["src"] * 0.62 * min(1, (t - 14) / 20 if t > 14 else 0.1))
             if c["title_id"] == "PPSA03333" and False: finish(c, "error")
             if t >= 48:
                 c["out_bytes"] = int(c["src"] * 0.62); finish(c, "done")
 
 def finish(c, stage):
-    state["hist"].append({"job": c["job"], "id": c["id"], "title": c["title"], "stage": stage, "src_bytes": c["src"] if stage == "done" else 0,
-                          "out_bytes": c["out_bytes"] if stage == "done" else 0, "error": c["error"]})
+    deleted = stage == "done" and c.get("delete_source", False)
+    state["hist"].append({"job": c["job"], "id": c["id"], "title": c["title"], "result": stage, "src_bytes": c["src"] if stage == "done" else 0,
+                          "out_bytes": c["out_bytes"] if stage == "done" else 0, "error": c["error"], "engine": c.get("engine"),
+                          "source_deleted": deleted, "freed_bytes": c["src"] if deleted else 0, "warning": ""})
+    if c.get("engine"): state["engine"][c["id"]] = c["engine"]
     if stage == "done": state["converted"].add(c["id"])
     state["cur"] = None
 
@@ -71,7 +81,8 @@ class H(BaseHTTPRequestHandler):
             with lock:
                 return self.send(200, {"games": [{"id": i, "title": t, "title_id": tid, "format": f, "drive": d, "image_path": "/%s/homebrew/%s.%s" % (d, tid, f),
                     "size_bytes": s, "converted": i in state["converted"], "compatible": None if comp else False,
-                    "dest_path": "/%s/ampr/%s" % (d, tid) if i in state["converted"] else ""} for i, t, tid, f, d, s, _c, comp in GAMES]})
+                    "dest_path": "/%s/ampr/%s" % (d, tid) if i in state["converted"] else "", "engine": state["engine"].get(i)}
+                    for i, t, tid, f, d, s, _c, comp in GAMES]})
         if p == "/api/icon":
             gid = q.split("=")[-1]
             if gid == "g4": return self.send(404, b"", "text/plain")
@@ -80,7 +91,8 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/status":
             with lock:
                 c = state["cur"]
-                cur = None if c is None else {k: c[k] for k in ("job", "id", "title", "stage", "bytes_done", "bytes_total", "src_bytes", "out_bytes", "speed_bps", "eta_s", "error")}
+                cur = None if c is None else {k: c[k] for k in ("job", "id", "title", "stage", "bytes_done", "bytes_total", "src_bytes", "out_bytes", "speed_bps", "eta_s", "error",
+                                                       "engine", "packed_bytes", "loose_bytes", "delete_source")}
                 return self.send(200, {"current": cur, "queue": [{"job": j["job"], "id": j["id"], "title": j["title"]} for j in state["queue"]], "history": state["hist"][-10:]})
         self.send(404, {"ok": False, "error": "não encontrado"})
     def do_POST(self):
@@ -90,8 +102,14 @@ class H(BaseHTTPRequestHandler):
                 g = next((x for x in GAMES if x[0] == d.get("id")), None)
                 if not g: return self.send(200, {"ok": False, "error": "Jogo não encontrado"})
                 if g[0] in state["converted"]: return self.send(200, {"ok": False, "error": "O destino já existe: /%s/ampr/%s" % (d.get("dest_drive"), g[2])})
+                kl = d.get("keep_loose", "")
+                if not isinstance(kl, str) or len(kl) > 255 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/,-" for ch in kl):
+                    return self.send(400, {"ok": False, "error": "keep_loose: até 255 caracteres de A-Z a-z 0-9 . _ / , -"})
+                if not isinstance(d.get("delete_source", False), bool):
+                    return self.send(400, {"ok": False, "error": "delete_source deve ser true ou false"})
                 state["n"] += 1
-                state["queue"].append({"job": state["n"], "id": g[0], "title": g[1], "title_id": g[2], "src": g[5]})
+                state["queue"].append({"job": state["n"], "id": g[0], "title": g[1], "title_id": g[2], "src": g[5],
+                                       "delete_source": d.get("delete_source", False), "keep_loose": kl})
                 return self.send(200, {"ok": True, "job": state["n"]})
             if self.path == "/api/cancel":
                 if state["cur"] and state["cur"]["job"] == d.get("job"): state["cur"]["cancel"] = True

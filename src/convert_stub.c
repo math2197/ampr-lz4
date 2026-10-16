@@ -40,6 +40,9 @@ int conv_run(const conv_opts_t *o, conv_progress_t *p) {
   const uint64_t src = 4ull << 30;
   atomic_store(&p->src_bytes, src);
   step(p, CONV_STAGE_SCAN, src, 1000);
+  atomic_store(&p->engine, CONV_ENGINE_UNREAL);
+  atomic_store(&p->packed_bytes, src * 7 / 10);
+  atomic_store(&p->loose_bytes, src - src * 7 / 10);
   step(p, CONV_STAGE_PACK, src, 8000);
   step(p, CONV_STAGE_COPY, src * 6 / 10, 2000);
   step(p, CONV_STAGE_VERIFY, src * 6 / 10, 2000);
@@ -49,7 +52,8 @@ int conv_run(const conv_opts_t *o, conv_progress_t *p) {
   snprintf(tmp, sizeof tmp, "%s/ampr_assets.index", o->dst_dir);
   FILE *f = fopen(tmp, "w");
   if (!f) { snprintf(p->error, sizeof p->error, "stub: não consegui gravar %s: %s", tmp, strerror(errno)); atomic_store(&p->stage, CONV_STAGE_ERROR); return -1; }
-  fprintf(f, "stub level=%d workers=%d fakelib=%s\n", o->level, o->workers, o->fakelib_sprx ? o->fakelib_sprx : "(none)");
+  fprintf(f, "stub level=%d workers=%d fakelib=%s keep_loose=%s\n", o->level, o->workers,
+          o->fakelib_sprx ? o->fakelib_sprx : "(none)", o->keep_loose ? o->keep_loose : "(none)");
   fclose(f);
   atomic_store(&p->out_bytes, src * 6 / 10);
   atomic_store(&p->stage, CONV_STAGE_DONE);

@@ -126,8 +126,9 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
 
   /* SCAN */
   atomic_store(&p->stage, CONV_STAGE_SCAN);
-  if (scan_tree(o->src_dir, o->fakelib_sprx, sr, err, sizeof err) != 0) return run_fail(R, "varredura: %s", err);
+  if (scan_tree_ex(o->src_dir, o->fakelib_sprx, o->keep_loose, sr, err, sizeof err) != 0) return run_fail(R, "varredura: %s", err);
   atomic_store(&p->src_bytes, sr->total_bytes);
+  scan_publish_estimate(sr, p);
 
   /* espaço livre no pai do destino */
   char parent[2048];
@@ -225,6 +226,10 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
     if (fclose(fp) != 0) return run_fail(R, "gravando %s.tmp: %s", AMPR_PAK4_NAME, strerror(errno));
   }
   int vrc = ampr_verify(o->dst_dir, tmp, crc_path, p, err, sizeof err);
+#ifndef __PROSPERO__
+  /* Só no host: simula falha da verificação (testa que a plataforma não apaga a origem). */
+  if (vrc == 0 && getenv("AMPR_HOST_FAIL_VERIFY")) { vrc = -1; snprintf(err, sizeof err, "verificação: falha simulada"); }
+#endif
   if (vrc == -2) return -2;
   if (vrc != 0) return run_fail(R, "%s", err);
   if (rename(tmp, man_path) != 0) return run_fail(R, "publicando %s: %s", AMPR_PAK4_NAME, strerror(errno));

@@ -85,6 +85,106 @@ void scan_classify(const char *rel, uint64_t size, scan_file_t *f) {
   }
 }
 
+/* ---------- perfis por engine e regras extras ----------
+ * O ampr_emu padrão só atende leituras feitas pela API AMPR (APR). Arquivos que a engine lê com
+ * open/read/pread/AIO comuns ou via mmap precisam ficar soltos (docs/ASSET_PACKS.md do ampr_emu,
+ * "The default production integration intercepts APR read-only opens"). */
+
+/* 1 se algum diretório de rel (não o nome do arquivo) é `name` (sem distinção de maiúsculas). */
+static int has_dir_ci(const char *rel, const char *name) {
+  size_t nl = strlen(name);
+  const char *p = rel;
+  for (;;) {
+    const char *e = strchr(p, '/');
+    if (!e) return 0;
+    if ((size_t)(e - p) == nl && strncasecmp(p, name, nl) == 0) return 1;
+    p = e + 1;
+  }
+}
+
+static const char *base_of(const char *rel) {
+  const char *b = strrchr(rel, '/');
+  return b ? b + 1 : rel;
+}
+
+int scan_detect_engine(const scan_file_t *files, size_t n) {
+  int unreal = 0, north = 0, unity = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char *rel = files[i].rel, *base = base_of(rel);
+    if (ends_with_ci(base, ".utoc") || ends_with_ci(base, ".ucas") ||
+        (ends_with_ci(base, ".pak") && has_dir_ci(rel, "Paks")))
+      unreal = 1;
+    else if (ends_with_ci(base, ".rmdtoc"))
+      north = 1;
+    else if (strcasecmp(base, "globalgamemanagers") == 0 || strcasecmp(base, "globalgamemanagers.assets") == 0 ||
+             ((ends_with_ci(base, ".assets") || ends_with_ci(base, ".resS")) && has_dir_ci(rel, "Media")))
+      unity = 1;
+  }
+  return unreal ? CONV_ENGINE_UNREAL : north ? CONV_ENGINE_NORTHLIGHT : unity ? CONV_ENGINE_UNITY : CONV_ENGINE_UNKNOWN;
+}
+
+int scan_keep_loose_match(const char *rel, const char *list) {
+  if (!list) return 0;
+  const char *base = base_of(rel);
+  const char *p = list;
+  while (*p) {
+    const char *e = strchr(p, ',');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    char tok[256];
+    while (len && (*p == ' ' || *p == '\t')) { p++; len--; }
+    while (len && (p[len - 1] == ' ' || p[len - 1] == '\t')) len--;
+    if (len && len < sizeof tok) {
+      memcpy(tok, p, len);
+      tok[len] = 0;
+      const char *t = tok;
+      if (strncasecmp(t, "/app0/", 6) == 0) t += 6;
+      while (*t == '/') t++;
+      size_t tl = strlen(t);
+      if (!tl) {
+        /* "/" ou "/app0/" sozinho: ignora (não manda o jogo inteiro para fora dos pacotes) */
+      } else if (strchr(t, '/')) {
+        /* caminho relativo: o próprio arquivo ou um diretório-prefixo */
+        if (strncasecmp(rel, t, tl) == 0 && (rel[tl] == 0 || rel[tl] == '/' || t[tl - 1] == '/')) return 1;
+      } else if (t[0] == '.') {
+        if (ends_with_ci(base, t)) return 1;
+      } else if (strcasecmp(base, t) == 0) {
+        return 1;
+      }
+    }
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
+
+void scan_apply_rules(scan_result_t *r, const char *keep_loose) {
+  r->engine = scan_detect_engine(r->files, r->n_files);
+  for (size_t i = 0; i < r->n_files; i++) {
+    scan_file_t *f = &r->files[i];
+    if (f->action != SCAN_ACT_PACK) continue;
+    const char *base = base_of(f->rel);
+    if (r->engine == CONV_ENGINE_UNREAL &&
+        (ends_with_ci(base, ".ucas") || ends_with_ci(base, ".utoc") || has_dir_ci(f->rel, "Paks"))) {
+      /* IoStore/pak: o FPlatformFile do Unreal lê .ucas/.utoc/.pak/.sig com I/O comum. */
+      f->action = SCAN_ACT_LOOSE;
+      f->reason = "engine-unreal";
+    } else if (r->engine == CONV_ENGINE_NORTHLIGHT && ends_with_ci(base, ".rmdtoc")) {
+      /* ampr_emu issue #7: Control quebra com .rmdtoc empacotado. */
+      f->action = SCAN_ACT_LOOSE;
+      f->reason = "engine-northlight";
+    } else if (scan_keep_loose_match(f->rel, keep_loose)) {
+      f->action = SCAN_ACT_LOOSE;
+      f->reason = "keep-loose";
+    }
+  }
+}
+
+void scan_publish_estimate(const scan_result_t *r, conv_progress_t *p) {
+  atomic_store(&p->engine, r->engine);
+  atomic_store(&p->packed_bytes, r->packed_bytes);
+  atomic_store(&p->loose_bytes, r->loose_bytes);
+}
+
 static int fail(scan_ctx *c, const char *fmt, const char *a, int e) {
   char m[256];
   snprintf(m, sizeof m, fmt, a);
@@ -189,6 +289,11 @@ static int cmp_key(const void *a, const void *b) {
 }
 
 int scan_tree(const char *src_dir, const char *fakelib_sprx, scan_result_t *out, char *err, size_t errlen) {
+  return scan_tree_ex(src_dir, fakelib_sprx, NULL, out, err, errlen);
+}
+
+int scan_tree_ex(const char *src_dir, const char *fakelib_sprx, const char *keep_loose, scan_result_t *out, char *err,
+                 size_t errlen) {
   memset(out, 0, sizeof *out);
   scan_ctx c = {out, 0, 0, src_dir, err, errlen};
   if (walk(&c, "") != 0) { scan_free(out); return -1; }
@@ -239,6 +344,10 @@ int scan_tree(const char *src_dir, const char *fakelib_sprx, scan_result_t *out,
     scan_free(out);
     return -1;
   }
+  scan_apply_rules(out, keep_loose);
+  for (size_t i = 0; i < out->n_files; i++)
+    if (out->files[i].action == SCAN_ACT_PACK && out->files[i].indexed) out->packed_bytes += out->files[i].size;
+  out->loose_bytes = out->total_bytes - out->packed_bytes;
   return 0;
 }
 
