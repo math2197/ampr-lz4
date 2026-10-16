@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Mock do ShadowMountPlus 1.7 (API /api/v1) para testar o payload no host.
 Uso: python3 -I tools/mock_smp.py [porta=10101] [pasta_runtime]
-O mount devolve (via /games/info) runtime_path apontando para uma pasta local com eboot.bin."""
+O mount devolve (via /games/info) runtime_path apontando para uma pasta local com eboot.bin.
+Testes: POST /mock/control {"unmount_fail": bool, "stay_mounted": bool} simula falha no desmonte
+(HTTP 500) ou desmonte que responde ok mas a imagem continua montada."""
 import json, os, struct, sys, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -24,6 +26,7 @@ GAMES = {
     "PPSA04004": dict(title_name="Jogo em Pasta (ignorado)", path="/data/homebrew/pasta", image_type="", color=(150, 150, 0), size=1000, folder=True),
 }
 STATE = {t: {"mounted": False, "fakelib": "disabled" if t == "PPSA01001" else "full"} for t in GAMES}
+CONTROL = {"unmount_fail": False, "stay_mounted": False}
 
 def game(t):
     g, s = GAMES[t], STATE[t]
@@ -55,6 +58,10 @@ class H(BaseHTTPRequestHandler):
         try: req = json.loads(self.rfile.read(n) or b"{}")
         except ValueError: return self.err(400, "bad json")
         p, t = self.path, req.get("title_id")
+        if p == "/mock/control":
+            for k in CONTROL:
+                if k in req: CONTROL[k] = bool(req[k])
+            return self.send(200, dict(CONTROL, status=0))
         if p == "/api/v1/version":
             return self.send(200, {"status": 0, "api_version": 1, "shadowmount_version": "1.7-mock", "capabilities": []})
         if p == "/api/v1/games":
@@ -71,7 +78,8 @@ class H(BaseHTTPRequestHandler):
                 STATE[t]["mounted"] = True
                 return self.send(200, {"status": 0, "title_id": t, "mounted": True, "mode": req.get("mode", "default")})
             if p.endswith("/unmount"):
-                STATE[t]["mounted"] = False
+                if CONTROL["unmount_fail"]: return self.err(500, "unmount failed (mock)")
+                if not CONTROL["stay_mounted"]: STATE[t]["mounted"] = False
                 return self.send(200, {"status": 0, "title_id": t, "mounted": False})
             m = req.get("mode")
             if m not in ("full", "emulators", "disabled", "default"): return self.err(400, "bad mode")

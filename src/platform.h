@@ -8,7 +8,9 @@ typedef struct {
   int port;      /* porta HTTP (padrão 8095) */
   int workers;   /* threads de compressão (padrão 4) */
   int level;     /* nível LZ4 padrão (padrão 6) */
-  int shortcut;  /* obsoleto, ignorado (o atalho é o payload separado ampr-shortcut.elf) */
+  int shortcut;  /* cria o atalho em Mídia no início (padrão 1; shortcut=0 desliga) */
+  int pack_all;  /* 1 = sem auto-loose: arquivos grandes vão para os pacotes mesmo sem ganho (padrão 0) */
+  char keep_loose[256]; /* extensões mantidas fora dos pacotes, separadas por vírgula (ex.: ".ucas,.rmdtoc"); padrão vazio */
 } plat_cfg_t;
 extern plat_cfg_t g_cfg;
 

@@ -214,7 +214,8 @@ int write_file_atomic(const char *path, const void *buf, size_t len, int mode) {
   if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) { errno = ENAMETOOLONG; return -1; }
   int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
   if (fd < 0) return -1;
-  if (write_full(fd, buf, len) != 0 || fsync(fd) != 0) {
+  /* chmod explícito: open passa pela umask */
+  if (fchmod(fd, (mode_t)mode) != 0 || write_full(fd, buf, len) != 0 || fsync(fd) != 0) {
     int e = errno; close(fd); unlink(tmp); errno = e; return -1;
   }
   if (close(fd) != 0 || rename(tmp, path) != 0) { int e = errno; unlink(tmp); errno = e; return -1; }

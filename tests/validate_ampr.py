@@ -6,6 +6,13 @@ e acrescenta as checagens do carregador C++ (ampr_emu_index.cpp / ampr_emu_pack_
 Python não faz. Por fim descomprime todos os arquivos pelo manifesto e compara SHA-256 com a origem.
 
 uso: python3 -I tests/validate_ampr.py <origem> <destino> [--fakelib caminho.sprx]
+         [--expect-loose REGRA ...] [--expect-packed REGRA ...] [--expect-hot REGRA ...]
+         [--expect-block-shift REGRA=N ...]
+REGRA usa a mesma sintaxe de keep_loose: ".ucas" (extensão), "global.ucas" (nome) ou
+"Content/Paks/" (prefixo de caminho relativo, com '/'). Cada regra precisa casar ao menos um arquivo,
+e todos os que casam precisam estar soltos (ou empacotados) no destino. --expect-hot exige empacotado com
+HOT|RANDOM_ACCESS (sem STREAMING). Todos os arquivos e diretórios do destino precisam ter modo 0777, e o
+.runtime (AMPRCFG1) precisa ter 8 workers, 1 reservado e o orçamento automático da referência.
 """
 from __future__ import annotations
 
@@ -25,7 +32,6 @@ import ampr_pack  # noqa: E402  (tools/ampr_pack.py do ampr_emu)
 import ampr_pack_format as fmt  # noqa: E402
 import build_ampr_index as bai  # noqa: E402
 
-EXEC_EXT = (".elf", ".self", ".prx", ".sprx")
 OUTPUT_NAMES = {
     "ampr_emu.index",
     "ampr_assets.index",
@@ -89,6 +95,34 @@ def source_rows(src: Path, fakelib: Path | None) -> list[tuple[int, int, str]]:
         ok = bai.validate_and_add_row(rows, seen, st.st_size, int(st.st_mtime), "/app0/fakelib/libSceAmpr.sprx", False)
         check(ok, "colisão fakelib")
     return rows
+
+
+def rule_match(rel: str, rule: str) -> bool:
+    """Mesma semântica de scan_keep_loose_match (src/scan.c), para um único token."""
+    t = rule.strip()
+    if t.lower().startswith("/app0/"):
+        t = t[6:]
+    t = t.lstrip("/")
+    if not t:
+        return False
+    r, tl, base = rel.lower(), t.lower(), rel.rsplit("/", 1)[-1].lower()
+    if "/" in t:
+        return r.startswith(tl) and (len(r) == len(tl) or r[len(tl)] == "/" or tl.endswith("/"))
+    if t.startswith("."):
+        return base.endswith(tl)
+    return base == tl
+
+
+def expected_runtime(manifest_len: int, idx_len: int) -> fmt.RuntimeSettings:
+    """runtime_budget() de theghostonline/PS5-LZ4-Compression (src/ampr_pack.c), 8 workers / reserva 1."""
+    mib = 1 << 20
+    workers = 8
+    fixed = 32 * 2 * mib + workers * mib + 32 * mib
+    used = fixed + manifest_len + idx_len + 16 * mib
+    avail = max(0, 384 * mib - used)
+    physical = min(avail // 4, 64 * mib)
+    decoded = min(avail - physical, 256 * mib)
+    return fmt.RuntimeSettings(decoded & ~16383, physical & ~16383, workers, 1)
 
 
 def check_idx3_like_cpp(data: bytes) -> None:
@@ -187,6 +221,10 @@ def main() -> int:
     ap.add_argument("src", type=Path)
     ap.add_argument("dst", type=Path)
     ap.add_argument("--fakelib", type=Path)
+    ap.add_argument("--expect-loose", action="append", default=[], metavar="REGRA")
+    ap.add_argument("--expect-packed", action="append", default=[], metavar="REGRA")
+    ap.add_argument("--expect-hot", action="append", default=[], metavar="REGRA")
+    ap.add_argument("--expect-block-shift", action="append", default=[], metavar="REGRA=N")
     a = ap.parse_args()
     src, dst = a.src.resolve(), a.dst.resolve()
 
@@ -214,7 +252,11 @@ def main() -> int:
         check(rec.path_hash == fmt.asset_path_hash(e.path), f"fileId {fid}: path_hash (base 0xCBF29CE484222325)")
     crcs = fmt.load_chunk_crcs(fmt.chunk_crc_path(man_path), m.build_id, len(m.chunks))
     rt = fmt.read_runtime_settings(Path(str(man_path) + ".runtime"), m.build_id)
-    check(rt is not None and rt == fmt.RuntimeSettings(128 << 20, 32 << 20, 4, 1), f"runtime: {rt}")
+    want_rt = expected_runtime(man_path.stat().st_size, idx_path.stat().st_size)
+    check(rt is not None and rt == want_rt, f"runtime: {rt} != {want_rt}")
+    check(rt.workers == 8 and rt.latency_reserve_workers == 1, f"runtime workers: {rt}")
+    print(f"CFG1 ok: workers={rt.workers} reserva={rt.latency_reserve_workers} "
+          f"decodificado={rt.decoded_cache_bytes} físico={rt.physical_cache_bytes}")
     vstats = ampr_pack.verify_packs(man_path)
     rstats = ampr_pack.verify_packs_against_root(man_path, src)
     padding = check_volume_gaps(dst, m)
@@ -227,6 +269,9 @@ def main() -> int:
     expected_on_disk: set[str] = set(OUTPUT_NAMES)
     expected_on_disk.update(m.pack_name(i) for i in range(len(m.packs)))
     packed = loose = 0
+    is_packed: dict[str, bool] = {}
+    flags_of: dict[str, int] = {}
+    shift_of: dict[str, int] = {}
     packed_bytes = loose_bytes = 0
     n_lz4 = sum(1 for c in m.chunks if c.codec == fmt.CHUNK_CODEC_LZ4)
     n_shared = sum(1 for c in m.chunks if c.flags & fmt.CHUNK_FLAG_SHARED)
@@ -238,6 +283,11 @@ def main() -> int:
             else:
                 srcf = src / rel
             want = sha256_file(srcf)
+            is_packed[rel] = bool(rec.flags & fmt.FILE_FLAG_PACKED)
+            flags_of[rel] = rec.flags
+            shift_of[rel] = rec.block_shift
+            check(not (rec.flags & fmt.FILE_FLAG_STREAMING and rec.flags & fmt.FILE_FLAG_RANDOM_ACCESS),
+                  f"STREAMING e RANDOM_ACCESS juntos: {rel}")
             if rec.flags & fmt.FILE_FLAG_PACKED:
                 h = hashlib.sha256()
                 for raw in reader.iter_file_data(fid):
@@ -250,10 +300,8 @@ def main() -> int:
                 d = dst / rel
                 check(d.is_file(), f"loose ausente: {rel}")
                 check(sha256_file(d) == want, f"SHA-256 difere (loose): {rel}")
-                base = rel.rsplit("/", 1)[-1].lower()
-                is_exec = base.endswith(EXEC_EXT) or base == "eboot.bin"
                 mode = stat.S_IMODE(d.stat().st_mode)
-                check(mode == (0o755 if is_exec else 0o644), f"permissão {oct(mode)} em {rel}")
+                check(mode == 0o777, f"permissão {oct(mode)} em {rel} (esperado 0777)")
                 expected_on_disk.add(rel)
                 loose += 1
                 loose_bytes += rec.logical_size
@@ -266,11 +314,43 @@ def main() -> int:
     extra = actual - expected_on_disk
     missing = expected_on_disk - actual
     check(not extra, f"arquivos inesperados no destino: {sorted(extra)[:10]}")
+    for p in sorted(actual):
+        mode = stat.S_IMODE((dst / p).lstat().st_mode)
+        check(mode == 0o777, f"permissão {oct(mode)} em {p} (esperado 0777)")
+    for dirpath, _dirs, _files in os.walk(dst):
+        mode = stat.S_IMODE(Path(dirpath).lstat().st_mode)
+        check(mode == 0o777, f"permissão {oct(mode)} no diretório {dirpath} (esperado 0777)")
     check(not missing, f"arquivos faltando no destino: {sorted(missing)[:10]}")
     for dirpath, dirnames, _ in os.walk(src):
         for dn in dirnames:
             rel = (Path(dirpath) / dn).relative_to(src)
             check((dst / rel).is_dir(), f"diretório não recriado: {rel}")
+
+    # 5) regras esperadas: arquivos que precisam ficar soltos (lidos fora da API AMPR) ou empacotados
+    for rules, want_packed, label in ((a.expect_loose, False, "solto"), (a.expect_packed, True, "empacotado")):
+        for rule in rules:
+            hits = [r for r in is_packed if rule_match(r, rule)]
+            check(bool(hits), f"regra {rule!r} não casou nenhum arquivo")
+            bad = [r for r in hits if is_packed[r] != want_packed]
+            check(not bad, f"regra {rule!r}: esperado {label}, mas não está: {sorted(bad)[:10]}")
+            if not want_packed:
+                for r in hits:
+                    check((dst / r).is_file(), f"regra {rule!r}: {r} não está solto no destino")
+            print(f"regra {label} ok: {rule!r} ({len(hits)} arquivo(s))")
+    hot = fmt.FILE_FLAG_HOT | fmt.FILE_FLAG_RANDOM_ACCESS
+    for rule in a.expect_hot:
+        hits = [r for r in is_packed if rule_match(r, rule)]
+        check(bool(hits), f"regra {rule!r} não casou nenhum arquivo")
+        bad = [r for r in hits if not is_packed[r] or flags_of[r] & hot != hot]
+        check(not bad, f"regra {rule!r}: esperado empacotado com HOT|RANDOM_ACCESS: {sorted(bad)[:10]}")
+        print(f"regra HOT|RANDOM_ACCESS ok: {rule!r} ({len(hits)} arquivo(s))")
+    for spec in a.expect_block_shift:
+        rule, n = spec.rsplit("=", 1)
+        hits = [r for r in is_packed if rule_match(r, rule)]
+        check(bool(hits), f"regra {rule!r} não casou nenhum arquivo")
+        bad = [r for r in hits if not is_packed[r] or shift_of[r] != int(n)]
+        check(not bad, f"regra {rule!r}: esperado empacotado com block_shift {n}: {sorted(bad)[:10]}")
+        print(f"regra block_shift ok: {rule!r} = {n} ({len(hits)} arquivo(s))")
 
     src_total = sum(r[0] for r in rows)
     dst_total = sum((dst / p).stat().st_size for p in actual)

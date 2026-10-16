@@ -177,7 +177,10 @@ int ampr_verify(const char *dst_dir, const char *manifest_path, const char *crc_
       continue;
     }
     uint64_t bs = 1ull << shift;
-    if (shift < 14 || shift > 20 || flags != AMPR_FILE_FLAG_PACKED || (uint64_t)first + count > nc ||
+    /* flags aceitos: PACKED, opcionalmente HOT e RANDOM_ACCESS (nunca STREAMING: só gravamos layout mixed) */
+    if (shift < 14 || shift > 20 ||
+        (flags & ~(uint32_t)(AMPR_FILE_FLAG_PACKED | AMPR_FILE_FLAG_HOT | AMPR_FILE_FLAG_RANDOM_ACCESS)) != 0 ||
+        (uint64_t)first + count > nc ||
         count != (size + bs - 1) / bs) {
       verr(err, errlen, "verificação: geometria inválida no arquivo %llu", (unsigned long long)f + 1);
       goto out;

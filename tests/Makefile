@@ -6,7 +6,7 @@ CPPFLAGS += -I$(ROOT)/src -I$(ROOT)/third_party/lz4
 LDLIBS += -lpthread
 BUILD := build
 
-CORE := util scan ampr_index ampr_pack verify convert
+CORE := util json profile scan ampr_index ampr_pack verify convert
 CORE_OBJ := $(addprefix $(BUILD)/,$(addsuffix .o,$(CORE))) $(BUILD)/lz4.o $(BUILD)/lz4hc.o
 
 all: $(BUILD)/host_convert $(BUILD)/test_hashes
@@ -14,7 +14,11 @@ all: $(BUILD)/host_convert $(BUILD)/test_hashes
 $(BUILD):
 	mkdir -p $@
 
-$(BUILD)/%.o: $(ROOT)/src/%.c $(wildcard $(ROOT)/src/*.h) | $(BUILD)
+# cabeçalho gerado pelo Makefile da raiz (perfis embutidos)
+$(ROOT)/src/profiles_asset.h: $(wildcard $(ROOT)/profiles/*)
+	$(MAKE) -C $(ROOT) src/profiles_asset.h
+
+$(BUILD)/%.o: $(ROOT)/src/%.c $(wildcard $(ROOT)/src/*.h) $(ROOT)/src/profiles_asset.h | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/lz4.o: $(ROOT)/third_party/lz4/lz4.c | $(BUILD)
@@ -32,6 +36,8 @@ $(BUILD)/test_hashes: test_hashes.c $(CORE_OBJ)
 test: all
 	./$(BUILD)/test_hashes
 	python3 -I run_e2e.py
+	$(MAKE) -C $(ROOT) host
+	python3 -I run_delete_source.py
 
 # Só compila os objetos com o toolchain do PS5 (sem linkar).
 PS5_SDK ?= $(HOME)/ps5-payload-sdk

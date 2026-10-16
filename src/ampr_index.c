@@ -6,6 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint64_t ampr_idx3_size(const scan_result_t *r) {
+  uint64_t n = r->n_indexed, path_bytes = 0, slots = 2;
+  if (n == 0) return 0;
+  for (size_t i = 0; i < r->n_files; i++)
+    if (r->files[i].indexed) path_bytes += (uint64_t)r->files[i].app0_len + 1;
+  while (slots < n * 2) slots <<= 1;
+  uint64_t path_off = AMPR_IDX3_HEADER_SIZE + n * AMPR_IDX3_ENTRY_SIZE;
+  return align_up_u64(path_off + path_bytes, AMPR_IDX3_SLOT_SIZE) + slots * AMPR_IDX3_SLOT_SIZE;
+}
+
 int ampr_idx3_build(const scan_result_t *r, uint8_t **out, size_t *out_len, char *err, size_t errlen) {
   *out = NULL;
   *out_len = 0;

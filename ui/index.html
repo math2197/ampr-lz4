@@ -56,13 +56,34 @@
         <h2 id="mTitle"></h2>
         <div class="meta" id="mMeta"></div>
         <div id="mDone" class="note ok" hidden></div>
+        <p id="mEngNote" class="note" hidden></p>
         <div id="mDestWrap">
           <h3>Destino</h3>
           <div class="opts" id="mDest" role="radiogroup" aria-label="Destino"></div>
         </div>
-        <h3>Compressão</h3>
-        <div class="opts lv" id="mLevel" role="radiogroup" aria-label="Compressão"></div>
-        <p class="note">A imagem original é mantida. Teste o jogo antes de apagá-la.</p>
+        <h3>Conversão AMPR LZ4</h3>
+        <div class="opts lv" id="mLevel" role="radiogroup" aria-label="Nível LZ4"></div>
+        <button type="button" role="checkbox" class="chk" id="mDel" aria-checked="false">
+          <span class="box" aria-hidden="true"></span>
+          <span>Apagar a imagem original depois de converter e verificar</span>
+        </button>
+        <p class="note" id="mKeep">A imagem original é mantida. Teste o jogo antes de apagá-la.</p>
+        <div class="adv">
+          <button type="button" id="mAdvToggle" class="advhead" aria-expanded="false" aria-controls="mAdv">
+            <span>Avançado</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div id="mAdv" hidden>
+            <label class="field" for="mLoose">Manter fora dos pacotes (extensões, separadas por vírgula)</label>
+            <input id="mLoose" class="input" type="text" maxlength="255" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder=".ucas,.rmdtoc">
+            <small class="hint">Também aceita caminhos relativos (Content/Paks/global.ucas). Somam-se às regras automáticas da engine.</small>
+            <button type="button" role="checkbox" class="chk chk-ac" id="mPackAll" aria-checked="false">
+              <span class="box" aria-hidden="true"></span>
+              <span>Empacotar mesmo sem ganho</span>
+            </button>
+            <small class="hint">Por padrão, arquivos de 64 MiB ou mais que quase não comprimem na amostragem ficam soltos. Marcado, eles vão para os pacotes LZ4 mesmo assim (o tamanho final quase não muda).</small>
+          </div>
+        </div>
         <div id="mErr" class="note err" hidden></div>
         <div class="actions">
           <button type="button" class="btn btn-primary" id="mGo">Converter</button>
@@ -92,6 +113,8 @@
   </div>
   <ol class="steps" id="jSteps"></ol>
   <div class="pbar"><i id="jBar"></i></div>
+  <div class="job-info" id="jInfo" hidden></div>
+  <div class="job-warn" id="jWarn" hidden></div>
   <div class="job-stats">
     <span id="jStage" class="stage"></span>
     <span id="jPct"></span>

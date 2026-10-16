@@ -1,4 +1,4 @@
-# AMPR-LZ4 - payload PS5 + web UI. Alvos: all (ELF PS5 + build/ampr-diag.elf + build/ampr-shortcut.elf), diag, host, host-stub, ps5-stub, test, clean.
+# AMPR-LZ4 - payload PS5 + web UI. Alvos: all (ELF PS5 + build/ampr-diag.elf), diag, host, host-stub, ps5-stub, test, clean.
 PS5_PAYLOAD_SDK ?= $(HOME)/ps5-payload-sdk
 PS5_HOST ?= ps5
 PS5_PORT ?= 9021
@@ -11,27 +11,27 @@ ifneq ($(wildcard $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk),)
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 endif
 
-PLAT_SRC := src/main.c src/httpd.c src/smp.c src/jobs.c src/json.c src/platform.c src/applog.c
+PLAT_SRC := src/main.c src/httpd.c src/smp.c src/jobs.c src/platform.c src/applog.c src/shortcut.c
+# núcleo: todo src/*.c exceto plataforma e stub (inclui json.c, usado pelos perfis embutidos)
 CORE_SRC := $(filter-out src/convert_stub.c $(PLAT_SRC),$(wildcard src/*.c)) \
             third_party/lz4/lz4.c third_party/lz4/lz4hc.c
-STUB_SRC := $(PLAT_SRC) src/convert_stub.c
+STUB_SRC := $(PLAT_SRC) src/json.c src/convert_stub.c
 
 WARN   := -Wall -Wextra
 CFLAGS_COMMON := -O2 -g $(WARN) -pthread -Isrc -Ithird_party/lz4
 ELF    := ampr-lz4.elf
-# Sem bibliotecas extras: só os DT_NEEDED padrão do SDK (libkernel_web, libSceLibcInternal, libSceNet).
-# Este ELF NUNCA toca libSceAppInstUtil: o atalho em Mídia é o payload separado build/ampr-shortcut.elf.
-PS5_LIBS :=
+# Link como o ftpsrv-ps5-install.elf (-lSceIpmi -lSceAppInstUtil, nessa ordem): necessário ao atalho em Mídia (src/shortcut.c).
+PS5_LIBS := -lSceIpmi -lSceAppInstUtil
 DIAG_ELF := build/ampr-diag.elf
-SHORTCUT_ELF := build/ampr-shortcut.elf
-GEN_H := src/ui_assets.h src/icon_asset.h src/ampr_sprx_asset.h
+GEN_H := src/ui_assets.h src/icon_asset.h src/ampr_sprx_asset.h src/profiles_asset.h
+PROFILE_FILES := $(sort $(wildcard profiles/*.toml)) profiles/index.json
 
 UI_NAMES := index.html app.css app.js
 # usa ui/ quando existir; senão placeholders SOMENTE dentro de build/
 UI_FILES := $(foreach f,$(UI_NAMES),$(if $(wildcard ui/$(f)),ui/$(f),build/placeholder/ui/$(f)))
 
-.PHONY: all shortcut diag host host-stub ps5-stub test clean
-all: $(ELF) $(DIAG_ELF) $(SHORTCUT_ELF)
+.PHONY: all diag host host-stub ps5-stub test clean
+all: $(ELF) $(DIAG_ELF)
 
 build/placeholder/ui/%:
 	@mkdir -p $(dir $@)
@@ -62,17 +62,26 @@ src/ampr_sprx_asset.h: assets/libSceAmpr.sprx Makefile
 	   echo "static const unsigned char libSceAmpr_sprx[] = {"; xxd -i < assets/libSceAmpr.sprx; echo "};"; \
 	   echo "static const unsigned int libSceAmpr_sprx_len = $$(wc -c < assets/libSceAmpr.sprx | tr -d ' ');"; } > $@
 
+# src/profiles_asset.h: perfis TOML + index.json embutidos (k_prof_files[]: nome, dados, tamanho); ver profiles/
+src/profiles_asset.h: $(PROFILE_FILES) Makefile
+	@echo "GEN $@"
+	@{ echo '/* gerado pelo Makefile - nao editar */'; \
+	   for f in $(PROFILE_FILES); do \
+	     n=prof_$$(basename $$f | tr -c 'A-Za-z0-9\n' '_'); \
+	     echo "static const unsigned char $$n[] = {"; xxd -i < $$f; echo "};"; \
+	   done; \
+	   echo "static const struct { const char *name; const unsigned char *data; unsigned int len; } k_prof_files[] = {"; \
+	   for f in $(PROFILE_FILES); do \
+	     n=prof_$$(basename $$f | tr -c 'A-Za-z0-9\n' '_'); \
+	     echo "  {\"$$(basename $$f)\", $$n, $$(wc -c < $$f | tr -d ' ')u},"; \
+	   done; \
+	   echo "};"; } > $@
+
 # payload de diagnóstico: compilado/linkado como o samples/hello_world do SDK
 diag: $(DIAG_ELF)
 $(DIAG_ELF): tools/diag/diag.c
 	@mkdir -p build
 	$(CC) -Wall -Werror -g -o $@ $^
-
-# payload separado do atalho em Mídia, linkado como o ftpsrv-ps5-install.elf (-lSceIpmi -lSceAppInstUtil)
-shortcut: $(SHORTCUT_ELF)
-$(SHORTCUT_ELF): tools/shortcut/shortcut.c src/icon_asset.h
-	@mkdir -p build
-	$(CC) -Wall -Wextra -Werror -g -Isrc -o $@ tools/shortcut/shortcut.c -lSceIpmi -lSceAppInstUtil
 
 $(ELF): $(PLAT_SRC) $(CORE_SRC) $(GEN_H)
 	$(CC) $(CFLAGS_COMMON) -DAMPR_PS5 -o $@ $(PLAT_SRC) $(CORE_SRC) $(PS5_LIBS)

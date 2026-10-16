@@ -8,7 +8,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-plat_cfg_t g_cfg = {8095, 4, 6, 1};
+plat_cfg_t g_cfg = {8095, 4, 6, 1, 0, ""};
 
 const char *plat_prefix(void) {
 #ifdef AMPR_PS5
@@ -99,7 +99,9 @@ void plat_load_config(void) {
     int x = atoi(v);
     if (!strcmp(k, "port") && x > 0 && x < 65536) g_cfg.port = x;
     else if (!strcmp(k, "workers") && x >= 1 && x <= 16) g_cfg.workers = x;
-    else if (!strcmp(k, "shortcut")) (void)x; /* obsoleta: no-op (atalho = build/ampr-shortcut.elf) */
+    else if (!strcmp(k, "shortcut")) g_cfg.shortcut = x != 0;
+    else if (!strcmp(k, "pack_all")) g_cfg.pack_all = x != 0;
+    else if (!strcmp(k, "keep_loose")) snprintf(g_cfg.keep_loose, sizeof g_cfg.keep_loose, "%s", v);
     else if (!strcmp(k, "level") && x >= 1 && x <= 12) g_cfg.level = x;
   }
   fclose(f);

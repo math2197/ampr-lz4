@@ -2,6 +2,7 @@
  * Segue tools/ampr_pack.py / tools/ampr_pack_format.py do ampr_emu (layout "mixed", grupo único,
  * blocos de 64 KiB ou 16 KiB, io_page 64 KiB, alinhamento de chunk 64 B). GPL-3.0. */
 #include "ampr_pack.h"
+#include "ampr_index.h"
 #include "util.h"
 #include "lz4.h"
 #include "lz4hc.h"
@@ -27,21 +28,54 @@
 
 /* ------------------------------------------------------------------ decisão de codec */
 
-int ampr_keep_lz4(uint32_t raw, uint32_t comp, uint32_t io_page) {
+int ampr_keep_lz4_ex(uint32_t raw, uint32_t comp, uint32_t io_page, uint32_t min_bytes, uint32_t min_bp,
+                     uint32_t io_min_bytes, uint32_t io_min_bp) {
   if (comp == 0 || comp >= raw) return 0;
   uint64_t saved = raw - comp;
-  /* min_savings_bytes=64, min_savings_ratio=0.01 */
-  uint64_t req_bytes = 64, req_permille = 10;
-  /* Layout não-streaming: se não economiza página de E/S, exige 8 KiB e 12,5 %. */
+  uint64_t req_bytes = min_bytes, req_bp = min_bp;
+  /* Layout não-streaming: se não economiza página de E/S, exige os limiares "io_neutral". */
   uint64_t raw_pages = (raw + (uint64_t)io_page - 1) / io_page;
   uint64_t comp_pages = (comp + (uint64_t)io_page - 1) / io_page;
   if (comp_pages >= raw_pages) {
-    req_bytes = 8192;
-    req_permille = 125;
+    req_bytes = io_min_bytes;
+    req_bp = io_min_bp;
   }
   if (saved < req_bytes) return 0;
-  if (saved * 1000u < (uint64_t)raw * req_permille) return 0; /* ratio < required (exato em inteiros) */
+  if (saved * 10000u < (uint64_t)raw * req_bp) return 0; /* ratio < required (exato em inteiros) */
   return 1;
+}
+
+int ampr_keep_lz4(uint32_t raw, uint32_t comp, uint32_t io_page) {
+  /* min_savings_bytes=64, min_savings_ratio=0.01, io_neutral 8 KiB / 0.125 */
+  return ampr_keep_lz4_ex(raw, comp, io_page, 64, 100, 8192, 1250);
+}
+
+void ampr_runtime_encode(uint8_t rt[AMPR_CFG1_SIZE], const uint8_t build_id[16], uint64_t manifest_len,
+                         uint64_t idx_len) {
+  /* runtime_budget() de theghostonline/PS5-LZ4-Compression src/ampr_pack.c (GPL-3.0-or-later,
+   * Copyright (C) 2026 Husam Osman): reserva os buffers fixos do runtime, o manifesto e o AMPRIDX3
+   * residentes e divide o resto do pool: 1/4 (até 64 MiB) para o cache físico, o resto (até 256 MiB)
+   * para o cache decodificado; ambos múltiplos de 16 KiB. */
+  const uint64_t MiB = 1ull << 20;
+  uint64_t fixed = 32 * 2 * MiB + (uint64_t)AMPR_RT_WORKERS * MiB + 32 * MiB;
+  uint64_t used = fixed + manifest_len + idx_len + 16 * MiB;
+  uint64_t avail = AMPR_RT_POOL_BYTES > used ? AMPR_RT_POOL_BYTES - used : 0;
+  uint64_t physical = avail / 4;
+  if (physical > 64 * MiB) physical = 64 * MiB;
+  uint64_t decoded = avail - physical;
+  if (decoded > 256 * MiB) decoded = 256 * MiB;
+  physical = align_down_u64(physical, 16384);
+  decoded = align_down_u64(decoded, 16384);
+  memset(rt, 0, AMPR_CFG1_SIZE);
+  memcpy(rt, "AMPRCFG1", 8);
+  le32_put(rt + 8, 1);
+  le32_put(rt + 12, AMPR_CFG1_SIZE);
+  memcpy(rt + 16, build_id, 16);
+  le64_put(rt + 32, decoded);
+  le64_put(rt + 40, physical);
+  le32_put(rt + 48, AMPR_RT_WORKERS);
+  le32_put(rt + 52, AMPR_RT_RESERVE_WORKERS);
+  le32_put(rt + 56, crc32_update(0, rt, AMPR_CFG1_SIZE));
 }
 
 /* ------------------------------------------------------------------ compressão */
@@ -65,9 +99,11 @@ static int lz4ctx_compress(lz4ctx_t *c, const uint8_t *src, uint32_t len, uint8_
 }
 
 /* Comprime um bloco; devolve codec e tamanho armazenado (dst recebe o LZ4 se codec==LZ4). */
-static uint8_t compress_block(lz4ctx_t *c, const uint8_t *raw, uint32_t len, uint8_t *dst, uint32_t *stored) {
+static uint8_t compress_block(lz4ctx_t *c, const scan_file_t *f, const uint8_t *raw, uint32_t len, uint8_t *dst,
+                              uint32_t *stored) {
   int n = lz4ctx_compress(c, raw, len, dst, len - 1);
-  if (n > 0 && ampr_keep_lz4(len, (uint32_t)n, AMPR_IO_PAGE_SIZE)) {
+  if (n > 0 && ampr_keep_lz4_ex(len, (uint32_t)n, AMPR_IO_PAGE_SIZE, f->sav_min_bytes, f->sav_min_bp,
+                                f->sav_io_min_bytes, f->sav_io_min_bp)) {
     *stored = (uint32_t)n;
     return AMPR_CHUNK_CODEC_LZ4;
   }
@@ -88,6 +124,7 @@ typedef struct {
 typedef struct {
   uint8_t *in, *out;
   blk_t *blk;
+  const scan_file_t *files; /* limiares de economia por arquivo */
   uint32_t n, used;
   _Atomic uint32_t next, done;
 } batch_t;
@@ -113,7 +150,7 @@ static void process_block(lz4ctx_t *c, batch_t *b, uint32_t i, int dedup) {
     sha256(raw, k->raw_len, d);
     memcpy(k->fp, d, 16);
   }
-  k->codec = compress_block(c, raw, k->raw_len, b->out + k->off, &k->stored_len);
+  k->codec = compress_block(c, &b->files[k->file], raw, k->raw_len, b->out + k->off, &k->stored_len);
 }
 
 static void *pool_worker(void *arg) {
@@ -274,13 +311,12 @@ typedef struct {
   uint64_t dd_mask;
   /* progresso */
   uint64_t done_bytes, total_bytes;
-  int last_decile;
 } pctx_t;
 
 static int perr(pctx_t *c, const char *fmt, const char *a, int e) {
   char m[256];
   snprintf(m, sizeof m, fmt, a ? a : "");
-  if (e) snprintf(c->err, c->errlen, "%s: %s", m, strerror(e));
+  if (e) snprintf(c->err, c->errlen, "%s: %s", m, e == ENOSPC ? "sem espaço no destino" : strerror(e));
   else snprintf(c->err, c->errlen, "%s", m);
   return -1;
 }
@@ -313,8 +349,10 @@ static int new_volume(pctx_t *c) {
   c->n_vols++;
   v->buf = (uint8_t *)malloc(VOL_BUF_BYTES);
   if (!v->buf) return perr(c, "sem memória", NULL, 0);
-  v->fd = open(v->tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  v->fd = open(v->tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0777);
   if (v->fd < 0) return perr(c, "não criou %s", v->tmp_path, errno);
+  /* 0777 explícito (umask): ver o comentário em convert.c sobre SIGBUS/CE-108255-1. */
+  if (fchmod(v->fd, 0777) != 0) return perr(c, "chmod %s", v->tmp_path, errno);
   if (vol_put(v, NULL, PAYLOAD_OFFSET) != 0) return perr(c, "escrita em %s", v->tmp_path, errno);
   v->padding = PAYLOAD_OFFSET - AMPR_DAT3_HEADER_SIZE;
   return 0;
@@ -415,6 +453,7 @@ static int fill_batch(pctx_t *c, batch_t *b) {
   b->n = 0;
   b->used = 0;
   scan_result_t *r = c->r;
+  b->files = r->files;
   while (c->fi < r->n_files) {
     scan_file_t *f = &r->files[c->fi];
     if (f->action != SCAN_ACT_PACK) { c->fi++; continue; }
@@ -465,20 +504,14 @@ static int place_batch(pctx_t *c, batch_t *b) {
     c->done_bytes += k->raw_len;
   }
   if (c->o->p) atomic_store(&c->o->p->bytes_done, c->done_bytes);
-  if (c->total_bytes) {
-    int dec = (int)(c->done_bytes * 10 / c->total_bytes);
-    if (dec > c->last_decile && dec < 10) {
-      c->last_decile = dec;
-      conv_notify("AMPR: compactando %d%%", dec * 10);
-    }
-  }
   return 0;
 }
 
 /* _sample_block_indices + _auto_loose_decision do ampr_pack.py */
 static int auto_loose(pctx_t *c, scan_file_t *f, lz4ctx_t *lz, uint8_t *in, uint8_t *out, int *loose) {
   *loose = 0;
-  if (f->size < AUTO_LOOSE_MIN_SIZE) return 0;
+  /* auto_loose_hot_files = false (padrão do ampr_pack.py): arquivos HOT nunca saem por amostragem. */
+  if (f->size < AUTO_LOOSE_MIN_SIZE || (f->file_flags & AMPR_FILE_FLAG_HOT)) return 0;
   uint64_t bs = 1ull << f->block_shift;
   uint64_t total = (f->size + bs - 1) / bs;
   uint64_t by_bytes = AUTO_LOOSE_SAMPLE_BYTES / bs;
@@ -499,7 +532,7 @@ static int auto_loose(pctx_t *c, scan_file_t *f, lz4ctx_t *lz, uint8_t *in, uint
     uint32_t len = (uint32_t)((f->size - off) < bs ? (f->size - off) : bs);
     if (pread_full(fd, in, len, (off_t)off) != 0) { close(fd); return perr(c, "leitura de %s", f->rel, errno); }
     uint32_t st;
-    uint8_t codec = compress_block(lz, in, len, out, &st);
+    uint8_t codec = compress_block(lz, f, in, len, out, &st);
     sampled += len;
     stored_sum += st;
     raw_blocks += codec == AMPR_CHUNK_CODEC_RAW;
@@ -511,6 +544,107 @@ static int auto_loose(pctx_t *c, scan_file_t *f, lz4ctx_t *lz, uint8_t *in, uint
   double raw_ratio = (double)raw_blocks / (double)count;
   *loose = savings < 0.05 || raw_ratio >= 0.90;
   return 0;
+}
+
+/* Estimativa do espaço de saída (pré-checagem de espaço livre): comprime uma amostra espalhada dos arquivos
+ * PACK com o mesmo compressor/limiares do empacotador e extrapola. Arquivos >= 64 MiB: até 64 blocos cada;
+ * menores: amostra combinada (primeiro bloco de arquivos espaçados). Orçamento total ~256 MiB. Sem pack_all,
+ * arquivo grande que cairia no auto-loose conta pelo tamanho cheio (vira solto). */
+#define EST_BLOCKS_PER_FILE 64u
+#define EST_BUDGET_BYTES (256ull << 20)
+#define EST_SMALL_BUDGET (32ull << 20)
+
+static int est_sample(int fd, const scan_file_t *f, uint64_t nblk, lz4ctx_t *lz, uint8_t *in, uint8_t *out,
+                      uint64_t *sampled, uint64_t *stored_sum, uint64_t *raw_blocks, uint64_t *count) {
+  uint64_t bs = 1ull << f->block_shift;
+  uint64_t total = (f->size + bs - 1) / bs;
+  uint64_t prev = UINT64_MAX;
+  for (uint64_t s = 0; s < nblk; s++) {
+    uint64_t idx = total <= nblk ? s : nblk == 1 ? total / 2 : (s * (total - 1)) / (nblk - 1);
+    if (idx >= total) break;
+    if (idx == prev) continue;
+    prev = idx;
+    uint64_t off = idx * bs;
+    uint32_t len = (uint32_t)((f->size - off) < bs ? (f->size - off) : bs);
+    if (pread_full(fd, in, len, (off_t)off) != 0) return -1;
+    uint32_t st;
+    uint8_t codec = compress_block(lz, f, in, len, out, &st);
+    *sampled += len;
+    *stored_sum += st;
+    *raw_blocks += codec == AMPR_CHUNK_CODEC_RAW;
+    (*count)++;
+  }
+  return 0;
+}
+
+int ampr_pack_estimate(const scan_result_t *r, int level, int pack_all, ampr_estimate_t *est, char *err,
+                       size_t errlen) {
+  memset(est, 0, sizeof *est);
+  level = level < 1 ? 1 : level > 12 ? 12 : level;
+  uint64_t maxbs = 1, n_big = 0, small_bytes = 0, n_small = 0, chunks = 0, n_packed_files = 0;
+  for (size_t i = 0; i < r->n_files; i++) {
+    const scan_file_t *f = &r->files[i];
+    if (!f->indexed || f->action != SCAN_ACT_PACK) { est->loose_bytes += f->size; continue; }
+    uint64_t bs = 1ull << f->block_shift;
+    if (bs > maxbs) maxbs = bs;
+    est->packed_src_bytes += f->size;
+    chunks += (f->size + bs - 1) / bs;
+    n_packed_files++;
+    if (f->size >= AUTO_LOOSE_MIN_SIZE) n_big++;
+    else { small_bytes += f->size; n_small++; }
+  }
+  /* manifesto/CRC/índice: ~16 B por chunk (+ CRC 4 B) e ~160 B por arquivo (nome incluído, com folga) */
+  est->overhead_bytes = chunks * 24 + n_packed_files * 160 + (1ull << 20);
+  uint8_t *in = (uint8_t *)malloc(maxbs), *out = (uint8_t *)malloc(maxbs);
+  lz4ctx_t lz = {NULL, level};
+  int rc = -1;
+  if (!in || !out || lz4ctx_init(&lz, level) != 0) { snprintf(err, errlen, "sem memória"); goto done; }
+
+  uint64_t big_budget = EST_BUDGET_BYTES - (n_small ? EST_SMALL_BUDGET : 0);
+  uint64_t big_blocks = n_big ? big_budget / maxbs / n_big : 0;
+  if (big_blocks > EST_BLOCKS_PER_FILE) big_blocks = EST_BLOCKS_PER_FILE;
+  if (big_blocks < 2) big_blocks = 2;
+  uint64_t small_stride = 1;
+  if (n_small) {
+    uint64_t want = EST_SMALL_BUDGET / maxbs;
+    if (want < 1) want = 1;
+    small_stride = (n_small + want - 1) / want;
+  }
+  uint64_t ss = 0, sst = 0, k = 0; /* amostra combinada dos pequenos */
+  for (size_t i = 0; i < r->n_files; i++) {
+    const scan_file_t *f = &r->files[i];
+    if (!f->indexed || f->action != SCAN_ACT_PACK) continue;
+    int big = f->size >= AUTO_LOOSE_MIN_SIZE;
+    if (!big && (k++ % small_stride) != 0) continue;
+    if (f->size == 0) continue;
+    int fd = open(f->src, O_RDONLY);
+    if (fd < 0) { snprintf(err, errlen, "não abriu %s: %s", f->src, strerror(errno)); goto done; }
+    uint64_t sa = 0, st = 0, rb = 0, ct = 0;
+    int e = est_sample(fd, f, big ? big_blocks : 1, &lz, in, out, &sa, &st, &rb, &ct);
+    int eno = errno;
+    close(fd);
+    if (e != 0) { snprintf(err, errlen, "leitura de %s: %s", f->rel, strerror(eno)); goto done; }
+    est->sampled_bytes += sa;
+    if (!big) { ss += sa; sst += st; continue; }
+    if (!sa) continue;
+    double savings = 1.0 - (double)st / (double)sa;
+    double raw_ratio = (double)rb / (double)ct;
+    if (!pack_all && !(f->file_flags & AMPR_FILE_FLAG_HOT) && (savings < 0.05 || raw_ratio >= 0.90)) {
+      est->loose_bytes += f->size; /* auto-loose: copiado inteiro */
+      est->auto_loose_bytes += f->size;
+    } else {
+      est->packed_est_bytes += (uint64_t)((double)f->size * (double)st / (double)sa) + 1;
+    }
+  }
+  /* pequenos: razão combinada aplicada a todos (a decisão de auto-loose só vale para >= 64 MiB) */
+  double sratio = ss ? (double)sst / (double)ss : 1.0;
+  est->packed_est_bytes += (uint64_t)((double)small_bytes * sratio) + (n_small ? 1 : 0);
+  rc = 0;
+done:
+  free(in);
+  free(out);
+  free(lz.state);
+  return rc;
 }
 
 /* ------------------------------------------------------------------ montagem */
@@ -570,7 +704,7 @@ static int assemble(pctx_t *c) {
     uint8_t *rec = m + files_off + fidx * AMPR_PAK4_FILE_REC;
     if (f->action == SCAN_ACT_PACK)
       put_file_rec(rec, hash, f->size, f->mtime, c->first_chunk[i], c->chunk_count[i], (uint32_t)spos, f->app0_len,
-                   AMPR_FILE_FLAG_PACKED, f->block_shift);
+                   AMPR_FILE_FLAG_PACKED | f->file_flags, f->block_shift);
     else
       put_file_rec(rec, hash, f->size, f->mtime, 0, 0, (uint32_t)spos, f->app0_len, 0, 0);
     spos += f->app0_len + 1u;
@@ -658,18 +792,8 @@ static int assemble(pctx_t *c) {
   res->crc = crcf;
   res->crc_len = (size_t)(AMPR_CRC1_HEADER_SIZE + nc * 4);
 
-  /* AMPRCFG1 (padrões do runtime) */
-  uint8_t *rt = res->runtime;
-  memset(rt, 0, AMPR_CFG1_SIZE);
-  memcpy(rt, "AMPRCFG1", 8);
-  le32_put(rt + 8, 1);
-  le32_put(rt + 12, AMPR_CFG1_SIZE);
-  memcpy(rt + 16, res->build_id, 16);
-  le64_put(rt + 32, 128ull << 20);
-  le64_put(rt + 40, 32ull << 20);
-  le32_put(rt + 48, 4);
-  le32_put(rt + 52, 1);
-  le32_put(rt + 56, crc32_update(0, rt, AMPR_CFG1_SIZE));
+  /* AMPRCFG1: orçamento automático (manifesto + AMPRIDX3 residentes) */
+  ampr_runtime_encode(res->runtime, res->build_id, total, ampr_idx3_size(r));
 
   /* cabeçalhos AMPRDAT3 e fechamento dos volumes */
   for (uint32_t i = 0; i < np; i++) {
@@ -708,7 +832,6 @@ int ampr_pack_build(scan_result_t *r, const ampr_pack_opts_t *o, ampr_pack_resul
   c.errlen = errlen;
   c.fd = -1;
   c.max_volume = o->max_volume ? o->max_volume : AMPR_MAX_VOLUME_BYTES;
-  c.last_decile = 0;
   int level = o->level < 1 ? 1 : o->level > 12 ? 12 : o->level;
   int workers = o->workers < 1 ? 1 : o->workers > 16 ? 16 : o->workers;
   int rc = -1;
@@ -731,7 +854,8 @@ int ampr_pack_build(scan_result_t *r, const ampr_pack_opts_t *o, ampr_pack_resul
     goto out;
   }
 
-  /* Planejamento: não indexados ficam loose; auto-loose por amostragem. */
+  /* Planejamento: não indexados ficam loose; auto-loose por amostragem (desligado com pack_all). */
+  if (o->p) atomic_store(&o->p->auto_loose_bytes, 0);
   uint64_t bound_chunks = 0;
   for (size_t i = 0; i < r->n_files; i++) {
     scan_file_t *f = &r->files[i];
@@ -739,11 +863,13 @@ int ampr_pack_build(scan_result_t *r, const ampr_pack_opts_t *o, ampr_pack_resul
     if (f->action != SCAN_ACT_PACK) continue;
     if (cancelled(&c)) { rc = -2; goto out; }
     int loose = 0;
-    if (auto_loose(&c, f, &lz, bt[0].in, bt[0].out, &loose) != 0) goto out;
+    if (!o->pack_all && auto_loose(&c, f, &lz, bt[0].in, bt[0].out, &loose) != 0) goto out;
     if (loose) {
       f->action = SCAN_ACT_LOOSE;
       f->reason = "auto-loose";
       res->files_auto_loose++;
+      res->auto_loose_bytes += f->size;
+      if (o->p) atomic_store(&o->p->auto_loose_bytes, res->auto_loose_bytes);
       continue;
     }
     c.total_bytes += f->size;

@@ -3,6 +3,7 @@
 #include "httpd.h"
 #include "jobs.h"
 #include "platform.h"
+#include "shortcut.h"
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -58,6 +59,7 @@ int main(void) {
   alog("ip local: %s", ip);
   alog_notify("AMPR-LZ4 pronto: http://%s:%d", ip, g_cfg.port);
   alog("servidor: aguardando conexões em 0.0.0.0:%d", g_cfg.port);
+  shortcut_start();
   httpd_serve(fd);
   alog("main: httpd_serve retornou (inesperado)");
   return 0;

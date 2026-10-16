@@ -19,6 +19,9 @@
 #define AMPR_CFG1_SIZE 64
 
 #define AMPR_FILE_FLAG_PACKED 1u
+#define AMPR_FILE_FLAG_STREAMING (1u << 2)     /* não gravado (só layout mixed); STREAMING e RANDOM_ACCESS são exclusivos */
+#define AMPR_FILE_FLAG_HOT (1u << 3)
+#define AMPR_FILE_FLAG_RANDOM_ACCESS (1u << 4)
 #define AMPR_CHUNK_CODEC_RAW 0u
 #define AMPR_CHUNK_CODEC_LZ4 1u
 #define AMPR_CHUNK_FLAG_SHARED (1u << 0)
@@ -37,6 +40,7 @@ typedef struct {
   int dedup;               /* deduplicação de blocos idênticos (SHA-256/16 + tamanho + codec) */
   uint64_t max_volume;     /* 0 = AMPR_MAX_VOLUME_BYTES */
   conv_progress_t *p;      /* progresso/cancelamento (pode ser NULL) */
+  int pack_all;            /* 1 = sem auto-loose (conv_opts_t.pack_all) */
 } ampr_pack_opts_t;
 
 typedef struct {
@@ -51,6 +55,7 @@ typedef struct {
   uint64_t logical_bytes, stored_bytes, padding_bytes;
   uint64_t chunks, chunks_lz4, chunks_raw, chunks_shared;
   uint64_t files_packed, files_loose, files_auto_loose;
+  uint64_t auto_loose_bytes; /* bytes lógicos dos arquivos tirados dos pacotes pelo auto-loose */
 } ampr_pack_result_t;
 
 /* Decide auto-loose (amostragem), comprime e grava os volumes .tmp e monta manifesto/CRC/runtime em
@@ -60,6 +65,30 @@ int ampr_pack_build(scan_result_t *r, const ampr_pack_opts_t *o, ampr_pack_resul
                     size_t errlen);
 void ampr_pack_result_free(ampr_pack_result_t *res);
 
+/* Estimativa de espaço de saída por amostragem (mesmo compressor/limiares do empacotador). */
+typedef struct {
+  uint64_t loose_bytes;      /* copiados soltos (inclui os que o auto-loose tiraria) */
+  uint64_t auto_loose_bytes; /* parte de loose_bytes prevista pelo auto-loose */
+  uint64_t packed_src_bytes; /* bytes lógicos planejados para os pacotes (antes do auto-loose) */
+  uint64_t packed_est_bytes; /* estimativa dos volumes (após compressão) */
+  uint64_t overhead_bytes;   /* manifesto + CRC + índice (folga incluída) */
+  uint64_t sampled_bytes;    /* bytes lidos/comprimidos na amostra */
+} ampr_estimate_t;
+int ampr_pack_estimate(const scan_result_t *r, int level, int pack_all, ampr_estimate_t *est, char *err,
+                       size_t errlen);
+
 /* Decisão de codec de um bloco conforme _compress_block (layout mixed, io_page 64 KiB):
  * devolve 1 se o resultado LZ4 de tamanho comp deve ser mantido para um bloco de raw bytes. */
 int ampr_keep_lz4(uint32_t raw, uint32_t comp, uint32_t io_page);
+/* Igual, com limiares explícitos (min_savings_* / io_neutral_min_savings_*, razões em 1/10000). */
+int ampr_keep_lz4_ex(uint32_t raw, uint32_t comp, uint32_t io_page, uint32_t min_bytes, uint32_t min_bp,
+                     uint32_t io_min_bytes, uint32_t io_min_bp);
+
+/* AMPRCFG1 com orçamento automático (ampr_pack_profile.c/ampr_pack.c da referência, runtime_budget):
+ * 8 workers, 1 reservado para latência; caches calculados a partir do pool de 384 MiB do runtime
+ * descontando manifesto e AMPRIDX3. */
+#define AMPR_RT_WORKERS 8u
+#define AMPR_RT_RESERVE_WORKERS 1u
+#define AMPR_RT_POOL_BYTES (384ull << 20)
+void ampr_runtime_encode(uint8_t out[AMPR_CFG1_SIZE], const uint8_t build_id[16], uint64_t manifest_len,
+                         uint64_t idx_len);

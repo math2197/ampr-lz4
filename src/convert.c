@@ -18,7 +18,33 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-#define SPACE_MARGIN (256ull << 20)
+#define SPACE_MARGIN (512ull << 20)
+
+/* Permissão de tudo o que gravamos no destino (pacotes, manifestos, loose, fakelib e diretórios): 0777.
+ * Cópias de dumps/imagens .exfat chegam como 0666/0644 e um eboot.bin ou módulo sem bit de execução derruba
+ * o jogo com SIGBUS / CE-108255-1 (007 First Light; changelog 1.4.3 de theghostonline/PS5-LZ4-Compression,
+ * "Everything the engine writes is now 0777"). Sempre com chmod explícito, porque open/mkdir passam pela umask. */
+#define DST_MODE 0777
+
+/* strerror com mensagem clara para disco cheio. */
+static const char *errstr(int e) { return e == ENOSPC ? "sem espaço no destino" : strerror(e); }
+
+/* Só log (sem notificação): vai ao hook da plataforma (log) ou, no host, ao stdout. */
+static void conv_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void conv_log(const char *fmt, ...) {
+  char msg[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof msg, fmt, ap);
+  va_end(ap);
+  if (conv_notify_hook) conv_notify_hook(msg);
+#ifndef __PROSPERO__
+  else {
+    printf("[log] %s\n", msg);
+    fflush(stdout);
+  }
+#endif
+}
 
 static void set_why(char *why, int len, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static void set_why(char *why, int len, const char *fmt, ...) {
@@ -51,7 +77,7 @@ int conv_check_source(const char *src_dir, char *why, int why_len) {
     return 3;
   }
   int r = file_contains(path, needle, sizeof needle - 1);
-  if (r < 0) { set_why(why, why_len, "não leu eboot.bin: %s", strerror(errno)); return 4; }
+  if (r < 0) { set_why(why, why_len, "não leu eboot.bin: %s", errstr(errno)); return 4; }
   if (r == 1) { set_why(why, why_len, "ok: eboot.bin importa libSceAmpr"); return 0; }
 
   char mod[2048];
@@ -74,6 +100,26 @@ int conv_check_source(const char *src_dir, char *why, int why_len) {
   }
   set_why(why, why_len, "o jogo não usa libSceAmpr (eboot.bin e sce_module/*.prx|*.sprx sem a string)");
   return 5;
+}
+
+/* 1 se o eboot.bin (ou um módulo em sce_module/) importa libScePlayGo e a origem não traz
+ * fakelib/libScePlayGo.sprx. Mesma checagem de check_playgo()/title_imports() em
+ * theghostonline/PS5-LZ4-Compression src/lzc_boot_files.c (GPL-3.0-or-later, Copyright (C) 2026 Husam
+ * Osman). A referência não distribui o stub (procura um emulador já instalado no console), então aqui só
+ * avisamos; a plataforma ainda confere a pasta de emuladores do SMP. */
+static int playgo_check(const scan_result_t *sr) {
+  static const char lib[] = "libScePlayGo";
+  for (size_t i = 0; i < sr->n_files; i++)
+    if (strcasecmp(sr->files[i].rel, "fakelib/libScePlayGo.sprx") == 0) return 0;
+  int imports = 0;
+  for (size_t i = 0; i < sr->n_files && !imports; i++) {
+    const char *rel = sr->files[i].rel;
+    int mod = strncasecmp(rel, "sce_module/", 11) == 0 && !strchr(rel + 11, '/') &&
+              (ends_ci(rel, ".prx") || ends_ci(rel, ".sprx"));
+    if (strcasecmp(rel, "eboot.bin") != 0 && !mod) continue;
+    imports = file_contains(sr->files[i].src, lib, sizeof lib - 1) == 1;
+  }
+  return imports;
 }
 
 typedef struct {
@@ -126,8 +172,22 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
 
   /* SCAN */
   atomic_store(&p->stage, CONV_STAGE_SCAN);
-  if (scan_tree(o->src_dir, o->fakelib_sprx, sr, err, sizeof err) != 0) return run_fail(R, "varredura: %s", err);
+  if (scan_tree_ex(o->src_dir, o->fakelib_sprx, o->keep_loose, sr, err, sizeof err) != 0) return run_fail(R, "varredura: %s", err);
   atomic_store(&p->src_bytes, sr->total_bytes);
+  if (sr->profile_err[0]) conv_log("AMPR: aviso: perfil embutido ignorado: %s", sr->profile_err);
+  if (sr->profile[0])
+    conv_log("AMPR: perfil %s (por %s; Title ID %s)", sr->profile, sr->profile_match,
+             sr->title_id[0] ? sr->title_id : "?");
+  else
+    conv_log("AMPR: sem perfil de jogo (Title ID %s); engine %s", sr->title_id[0] ? sr->title_id : "?",
+             conv_engine_name(sr->engine));
+  if (playgo_check(sr)) {
+    atomic_store(&p->playgo_missing, 1);
+    conv_log("AMPR: aviso: o jogo importa libScePlayGo e não há fakelib/libScePlayGo.sprx na origem; "
+             "rodando de pasta, scePlayGoOpen falha e jogos que conferem isso param com SIGBUS no boot. "
+             "Instale um emulador de PlayGo (fakelib/libScePlayGo.sprx) se o jogo não abrir.");
+  }
+  scan_publish_estimate(sr, p);
 
   /* espaço livre no pai do destino */
   char parent[2048];
@@ -136,27 +196,42 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
   if (slash && slash != parent) *slash = 0;
   else if (slash) parent[1] = 0;
   else snprintf(parent, sizeof parent, ".");
-  if (mkdir_p(parent, 0755) != 0) return run_fail(R, "não criou %s: %s", parent, strerror(errno));
+  if (mkdir_p(parent, 0755) != 0) return run_fail(R, "não criou %s: %s", parent, errstr(errno));
   struct statvfs vf;
-  if (statvfs(parent, &vf) != 0) return run_fail(R, "statvfs(%s): %s", parent, strerror(errno));
+  if (statvfs(parent, &vf) != 0) return run_fail(R, "statvfs(%s): %s", parent, errstr(errno));
   uint64_t avail = (uint64_t)vf.f_bavail * (uint64_t)(vf.f_frsize ? vf.f_frsize : vf.f_bsize);
-  uint64_t need = sr->total_bytes + SPACE_MARGIN;
+#ifndef __PROSPERO__
+  /* Só no host: limite de espaço livre simulado (testes). */
+  if (getenv("AMPR_TEST_FREE_MIB")) avail = strtoull(getenv("AMPR_TEST_FREE_MIB"), NULL, 10) << 20;
+#endif
+  /* Necessário = soltos + saída empacotada estimada por amostragem + margem (10% + 512 MiB). */
+  ampr_estimate_t est;
+  if (ampr_pack_estimate(sr, o->level, o->pack_all ? 1 : 0, &est, err, sizeof err) != 0)
+    return run_fail(R, "estimativa de espaço: %s", err);
+  uint64_t body = est.packed_est_bytes + est.overhead_bytes;
+  uint64_t need = est.loose_bytes + body + body / 10 + SPACE_MARGIN;
+  double pct = est.packed_src_bytes ? 100.0 * (double)est.sampled_bytes / (double)est.packed_src_bytes : 0.0;
+  conv_log("AMPR: espaço: livre %llu MiB, estimado %llu MiB (amostra %.2f%%)", (unsigned long long)(avail >> 20),
+           (unsigned long long)(need >> 20), pct);
   if (avail < need)
     return run_fail(R, "espaço insuficiente em %s: livre %llu MiB, necessário %llu MiB", parent,
                     (unsigned long long)(avail >> 20), (unsigned long long)(need >> 20));
 
-  if (mkdir(o->dst_dir, 0755) != 0) return run_fail(R, "não criou %s: %s", o->dst_dir, strerror(errno));
+  if (mkdir(o->dst_dir, DST_MODE) != 0) return run_fail(R, "não criou %s: %s", o->dst_dir, errstr(errno));
   R->dst_created = 1;
+  if (chmod(o->dst_dir, DST_MODE) != 0) return run_fail(R, "chmod %s: %s", o->dst_dir, errstr(errno));
   for (size_t i = 0; i < sr->n_dirs; i++) {
-    if (path_join(path, sizeof path, o->dst_dir, sr->dirs[i]) != 0 || mkdir_p(path, 0755) != 0)
+    if (path_join(path, sizeof path, o->dst_dir, sr->dirs[i]) != 0 || mkdir_p(path, DST_MODE) != 0 ||
+        chmod(path, DST_MODE) != 0)
       return run_fail(R, "não criou diretório %s", sr->dirs[i]);
   }
   if (is_cancel(R)) return -2;
 
   /* PACK */
   atomic_store(&p->stage, CONV_STAGE_PACK);
-  conv_notify("AMPR: compactando %s", o->src_dir);
-  ampr_pack_opts_t po = {o->dst_dir, o->level, o->workers, 1, 0, p};
+  conv_log("AMPR: compactando %s", o->src_dir);
+  ampr_pack_opts_t po = {o->dst_dir, o->level, o->workers, 1, 0, p, o->pack_all ? 1 : 0};
+  if (po.pack_all) conv_log("AMPR: pack_all ativo (sem auto-loose)");
 #ifndef __PROSPERO__
   /* Só no host: volume máximo reduzido para testar o rollover sem 16 GB de dados. */
   if (getenv("AMPR_HOST_MAX_VOLUME")) po.max_volume = strtoull(getenv("AMPR_HOST_MAX_VOLUME"), NULL, 10);
@@ -164,6 +239,9 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
   int prc = ampr_pack_build(sr, &po, pr, err, sizeof err);
   if (prc == -2) return -2;
   if (prc != 0) return run_fail(R, "compactação: %s", err);
+  if (pr->files_auto_loose)
+    conv_log("AMPR: auto-loose: %llu arquivo(s), %llu MiB soltos (sem ganho na amostragem)",
+             (unsigned long long)pr->files_auto_loose, (unsigned long long)(pr->auto_loose_bytes >> 20));
 
   /* COPY (loose) */
   atomic_store(&p->stage, CONV_STAGE_COPY);
@@ -176,9 +254,9 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
     scan_file_t *f = &sr->files[i];
     if (f->action != SCAN_ACT_LOOSE) continue;
     if (path_join(path, sizeof path, o->dst_dir, f->rel) != 0) return run_fail(R, "caminho longo: %s", f->rel);
-    int c = copy_file_atomic(f->src, path, f->exec ? 0755 : 0644, &p->bytes_done, &p->cancel);
+    int c = copy_file_atomic(f->src, path, DST_MODE, &p->bytes_done, &p->cancel);
     if (c == -2) return -2;
-    if (c != 0) return run_fail(R, "cópia de %s: %s", f->rel, strerror(errno));
+    if (c != 0) return run_fail(R, "cópia de %s: %s", f->rel, errstr(errno));
     set_times(path, f->mtime);
   }
 
@@ -186,9 +264,9 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
   uint8_t *idx = NULL;
   size_t idx_len = 0;
   if (ampr_idx3_build(sr, &idx, &idx_len, err, sizeof err) != 0) return run_fail(R, "%s", err);
-  if (path_join(path, sizeof path, o->dst_dir, AMPR_IDX3_NAME) != 0 || write_file_atomic(path, idx, idx_len, 0644) != 0) {
+  if (path_join(path, sizeof path, o->dst_dir, AMPR_IDX3_NAME) != 0 || write_file_atomic(path, idx, idx_len, DST_MODE) != 0) {
     free(idx);
-    return run_fail(R, "gravando %s: %s", AMPR_IDX3_NAME, strerror(errno));
+    return run_fail(R, "gravando %s: %s", AMPR_IDX3_NAME, errstr(errno));
   }
   free(idx);
   if (is_cancel(R)) return -2;
@@ -199,16 +277,16 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
     snprintf(name, sizeof name, AMPR_PACK_NAME_FMT, i);
     if (path_join(path, sizeof path, o->dst_dir, name) != 0) return run_fail(R, "caminho longo");
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    if (rename(tmp, path) != 0) return run_fail(R, "publicando %s: %s", name, strerror(errno));
+    if (rename(tmp, path) != 0) return run_fail(R, "publicando %s: %s", name, errstr(errno));
   }
   fsync_dir(o->dst_dir);
   char crc_path[2048], man_path[2048];
   if (path_join(crc_path, sizeof crc_path, o->dst_dir, AMPR_CRC1_NAME) != 0 ||
-      write_file_atomic(crc_path, pr->crc, pr->crc_len, 0644) != 0)
-    return run_fail(R, "gravando %s: %s", AMPR_CRC1_NAME, strerror(errno));
+      write_file_atomic(crc_path, pr->crc, pr->crc_len, DST_MODE) != 0)
+    return run_fail(R, "gravando %s: %s", AMPR_CRC1_NAME, errstr(errno));
   if (path_join(path, sizeof path, o->dst_dir, AMPR_CFG1_NAME) != 0 ||
-      write_file_atomic(path, pr->runtime, AMPR_CFG1_SIZE, 0644) != 0)
-    return run_fail(R, "gravando %s: %s", AMPR_CFG1_NAME, strerror(errno));
+      write_file_atomic(path, pr->runtime, AMPR_CFG1_SIZE, DST_MODE) != 0)
+    return run_fail(R, "gravando %s: %s", AMPR_CFG1_NAME, errstr(errno));
 
   /* VERIFY: manifesto gravado como .tmp, verificado a partir do disco e só então publicado. */
   atomic_store(&p->stage, CONV_STAGE_VERIFY);
@@ -216,18 +294,22 @@ static int do_run(run_t *R, scan_result_t *sr, ampr_pack_result_t *pr) {
   snprintf(tmp, sizeof tmp, "%s.tmp", man_path);
   {
     FILE *fp = fopen(tmp, "wb");
-    if (!fp || fwrite(pr->manifest, 1, pr->manifest_len, fp) != pr->manifest_len || fflush(fp) != 0 ||
-        fsync(fileno(fp)) != 0) {
+    if (!fp || fchmod(fileno(fp), DST_MODE) != 0 || fwrite(pr->manifest, 1, pr->manifest_len, fp) != pr->manifest_len ||
+        fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
       int e = errno;
       if (fp) fclose(fp);
-      return run_fail(R, "gravando %s.tmp: %s", AMPR_PAK4_NAME, strerror(e));
+      return run_fail(R, "gravando %s.tmp: %s", AMPR_PAK4_NAME, errstr(e));
     }
-    if (fclose(fp) != 0) return run_fail(R, "gravando %s.tmp: %s", AMPR_PAK4_NAME, strerror(errno));
+    if (fclose(fp) != 0) return run_fail(R, "gravando %s.tmp: %s", AMPR_PAK4_NAME, errstr(errno));
   }
   int vrc = ampr_verify(o->dst_dir, tmp, crc_path, p, err, sizeof err);
+#ifndef __PROSPERO__
+  /* Só no host: simula falha da verificação (testa que a plataforma não apaga a origem). */
+  if (vrc == 0 && getenv("AMPR_HOST_FAIL_VERIFY")) { vrc = -1; snprintf(err, sizeof err, "verificação: falha simulada"); }
+#endif
   if (vrc == -2) return -2;
   if (vrc != 0) return run_fail(R, "%s", err);
-  if (rename(tmp, man_path) != 0) return run_fail(R, "publicando %s: %s", AMPR_PAK4_NAME, strerror(errno));
+  if (rename(tmp, man_path) != 0) return run_fail(R, "publicando %s: %s", AMPR_PAK4_NAME, errstr(errno));
   fsync_dir(o->dst_dir);
 
   uint64_t out = pr->volume_bytes + pr->crc_len + AMPR_CFG1_SIZE + pr->manifest_len + idx_len;
@@ -243,6 +325,9 @@ int conv_run(const conv_opts_t *o, conv_progress_t *p) {
   atomic_store(&p->bytes_done, 0);
   atomic_store(&p->src_bytes, 0);
   atomic_store(&p->out_bytes, 0);
+  atomic_store(&p->playgo_missing, 0);
+  atomic_store(&p->auto_loose_bytes, 0);
+  p->profile[0] = 0;
   p->error[0] = 0;
   run_t R = {o, p, 0};
   scan_result_t sr;
@@ -257,14 +342,14 @@ int conv_run(const conv_opts_t *o, conv_progress_t *p) {
   if (rc == -2) {
     snprintf(p->error, sizeof p->error, "cancelado");
     atomic_store(&p->stage, CONV_STAGE_CANCELLED);
-    conv_notify("AMPR: conversão cancelada");
+    conv_log("AMPR: conversão cancelada");
   } else if (rc != 0) {
     atomic_store(&p->stage, CONV_STAGE_ERROR);
-    conv_notify("AMPR: erro: %s", p->error);
+    conv_log("AMPR: erro: %s", p->error);
   } else {
     uint64_t src = atomic_load(&p->src_bytes), out = atomic_load(&p->out_bytes);
     atomic_store(&p->stage, CONV_STAGE_DONE);
-    conv_notify("AMPR: concluído %llu MiB -> %llu MiB (%.1f%%) em %llus", (unsigned long long)(src >> 20),
+    conv_log("AMPR: concluído %llu MiB -> %llu MiB (%.1f%%) em %llus", (unsigned long long)(src >> 20),
                 (unsigned long long)(out >> 20), src ? 100.0 * (double)out / (double)src : 0.0,
                 (unsigned long long)((now_ms() - t0) / 1000));
   }

@@ -1,8 +1,16 @@
-/* CLI host (macOS/Linux) para testar o núcleo de conversão AMPR. GPL-3.0.
- * uso: host_convert [-l nivel] [-w workers] [-f fakelib.sprx] [-c] [-x ms] <origem> <destino>
- *   -c  só roda conv_check_source; -x  seta cancel após ms (teste) */
+/* CLI host (macOS/Linux) do núcleo de conversão AMPR: converte uma PASTA de jogo já extraída/montada
+ * (não lê imagens .exfat/.ffpfsc). GPL-3.0.
+ * uso: host_convert [opções] <origem> <destino>
+ *   -l, --level N        nível LZ4 1..12 (padrão 9)
+ *   -w, --workers N      threads de compressão 1..16 (padrão 4)
+ *   -f, --fakelib ARQ    libSceAmpr.sprx a gravar em fakelib/ do destino
+ *   -k, --keep-loose L   regras extras de manter solto (ex.: .ucas,Content/Movies/)
+ *   -a, --pack-all       sem auto-loose: arquivos >= 64 MiB vão para os pacotes mesmo sem ganho
+ *   -c, --check          só roda conv_check_source
+ *   -x MS                seta cancel após MS ms (teste) */
 #include "../src/convert.h"
 
+#include <getopt.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,25 +43,39 @@ static double now_s(void) {
   return (double)tv.tv_sec + tv.tv_usec / 1e6;
 }
 
+static void usage(const char *argv0) {
+  fprintf(stderr,
+          "uso: %s [-l|--level nivel] [-w|--workers n] [-f|--fakelib sprx] [-k|--keep-loose lista] [-a|--pack-all]\n"
+          "       [-c|--check] <origem> [destino]\n",
+          argv0);
+}
+
 int main(int argc, char **argv) {
   static job_t j;
+  static const struct option lopts[] = {
+      {"level", required_argument, NULL, 'l'},      {"workers", required_argument, NULL, 'w'},
+      {"fakelib", required_argument, NULL, 'f'},    {"keep-loose", required_argument, NULL, 'k'},
+      {"pack-all", no_argument, NULL, 'a'},         {"check", no_argument, NULL, 'c'},
+      {NULL, 0, NULL, 0}};
   j.o.level = 9;
   j.o.workers = 4;
   int check_only = 0, ch, cancel_ms = -1;
-  while ((ch = getopt(argc, argv, "l:w:f:cx:")) != -1) {
+  while ((ch = getopt_long(argc, argv, "l:w:f:k:acx:", lopts, NULL)) != -1) {
     switch (ch) {
       case 'l': j.o.level = atoi(optarg); break;
       case 'w': j.o.workers = atoi(optarg); break;
       case 'f': j.o.fakelib_sprx = optarg; break;
+      case 'k': j.o.keep_loose = optarg; break;
+      case 'a': j.o.pack_all = 1; break;
       case 'c': check_only = 1; break;
       case 'x': cancel_ms = atoi(optarg); break; /* teste: cancela após N ms */
       default:
-        fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-c] <origem> [destino]\n", argv[0]);
+        usage(argv[0]);
         return 2;
     }
   }
   if (argc - optind < (check_only ? 1 : 2)) {
-    fprintf(stderr, "uso: %s [-l nivel] [-w workers] [-f fakelib.sprx] [-c] <origem> [destino]\n", argv[0]);
+    usage(argv[0]);
     return 2;
   }
   j.o.src_dir = argv[optind];
@@ -84,6 +106,10 @@ int main(int argc, char **argv) {
   }
   pthread_join(th, NULL);
   double el = now_s() - t0;
+  printf("estimativa: engine=%s profile=%s playgo_missing=%d packed=%llu loose=%llu auto_loose=%llu pack_all=%d\n",
+         conv_engine_name(atomic_load(&j.p.engine)), j.p.profile[0] ? j.p.profile : "-", atomic_load(&j.p.playgo_missing),
+         (unsigned long long)atomic_load(&j.p.packed_bytes), (unsigned long long)atomic_load(&j.p.loose_bytes),
+         (unsigned long long)atomic_load(&j.p.auto_loose_bytes), j.o.pack_all);
   uint64_t src = atomic_load(&j.p.src_bytes), out = atomic_load(&j.p.out_bytes);
   printf("resultado: rc=%d stage=%s tempo=%.2fs origem=%llu bytes saída=%llu bytes razão=%.2f%%%s%s\n", j.rc,
          stage_name(atomic_load(&j.p.stage)), el, (unsigned long long)src, (unsigned long long)out,

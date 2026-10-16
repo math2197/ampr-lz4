@@ -12,3 +12,5 @@
 /* Monta o AMPRIDX3 com os arquivos indexed de r (já ordenados por chave dobrada;
  * fileId = posição entre os indexados + 1). *out alocado com malloc. 0 ok. */
 int ampr_idx3_build(const scan_result_t *r, uint8_t **out, size_t *out_len, char *err, size_t errlen);
+/* Tamanho em bytes do AMPRIDX3 que ampr_idx3_build geraria (0 se inválido). */
+uint64_t ampr_idx3_size(const scan_result_t *r);

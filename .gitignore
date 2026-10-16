@@ -8,3 +8,5 @@ tests/build/
 src/ui_assets.h
 src/icon_asset.h
 src/ampr_sprx_asset.h
+.claude/
+src/profiles_asset.h

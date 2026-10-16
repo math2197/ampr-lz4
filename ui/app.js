@@ -2,16 +2,20 @@
 'use strict';
 var $ = function (id) { return document.getElementById(id); };
 var S = { games: [], info: null, filter: 'all', status: null, loaded: false, error: null,
-  sel: null, dest: null, level: 9, lastJob: null, timer: null, histOpen: false, busy: false };
+  sel: null, dest: null, level: 9, lastJob: null, timer: null, histOpen: false, busy: false,
+  del: false, advOpen: false, packAll: false };
 var STAGES = ['mount', 'scan', 'pack', 'copy', 'verify', 'finish'];
-var STAGE_PT = { mount: 'Montando imagem', scan: 'Analisando arquivos', pack: 'Comprimindo',
+var STAGE_PT = { mount: 'Montando imagem', scan: 'Analisando arquivos', pack: 'Gerando pacotes AMPR',
   copy: 'Copiando arquivos', verify: 'Verificando', finish: 'Finalizando', done: 'Concluído',
   error: 'Erro', cancelled: 'Cancelado' };
 var DRIVES = { data: ['Interno', '/data'], ext0: ['M.2', 'ext0'], ext1: ['M.2', 'ext1'] };
 var LEVELS = [
-  { l: 4, n: 'Rápida', d: 'Menos tempo, economiza menos espaço' },
-  { l: 9, n: 'Equilibrada', d: 'Bom equilíbrio (recomendado)' },
-  { l: 12, n: 'Máxima', d: 'Mais lenta, menor tamanho' }];
+  { l: 4, n: 'Rápida', d: 'Conversão mais curta, pacotes maiores' },
+  { l: 9, n: 'Equilibrada', d: 'Recomendado' },
+  { l: 12, n: 'Máxima', d: 'Conversão mais lenta, pacotes menores' }];
+var UNREAL_NOTE = 'Unreal: os .ucas costumam já vir comprimidos (Oodle), então a redução de tamanho pode ser pequena.';
+var ENGINE_PT = { unreal: 'Unreal', unity: 'Unity', northlight: 'Northlight', unknown: 'Engine não identificada' };
+var KEEP_RE = /^[A-Za-z0-9._\/,-]*$/;
 var PAL = [['#0a4d9c', '#3b9cff'], ['#5b2a86', '#c06cf0'], ['#0e6b5c', '#35d0a8'], ['#8a3a1d', '#ff9a5a'],
   ['#7a1f4a', '#ff6fa5'], ['#2d4a8a', '#7aa5ff'], ['#5a6b14', '#c4e04a']];
 
@@ -61,7 +65,7 @@ function visible() {
   return S.games.filter(function (g) { return S.filter === 'all' || (S.filter === 'done') === !!g.converted; });
 }
 function renderGrid() {
-  var key = [S.filter, S.loaded, S.error, S.games.map(function (g) { return g.id + g.converted + g.compatible + (jobState(g.id) || ''); }).join()].join('|');
+  var key = [S.filter, S.loaded, S.error, S.games.map(function (g) { return g.id + g.converted + g.compatible + (g.engine || '') + (jobState(g.id) || ''); }).join()].join('|');
   if (key === S.gridKey) return;
   var anim = S.gridFilter !== S.filter || !S.gridKey; S.gridKey = key; S.gridFilter = S.filter;
   var all = S.games, done = all.filter(function (g) { return g.converted; }).length;
@@ -91,10 +95,11 @@ function renderGrid() {
     if (g.converted) b += '<span class="badge b-ok">Convertido</span>';
     if (g.compatible === false) b += '<span class="badge b-gray">Incompatível</span>';
     var d = DRIVES[g.drive] || [g.drive, ''];
+    var eg = g.engine && ENGINE_PT[g.engine] && g.engine !== 'unknown' ? '<span class="chip">' + esc(ENGINE_PT[g.engine]) + '</span>' : '';
     h += '<button type="button" class="card' + (anim ? ' in' : '') + '" data-id="' + esc(g.id) + '" style="animation-delay:' + Math.min(i, 12) * 30 + 'ms">' +
       cover(g, false, '<div class="badges">' + b + '</div>') +
       '<div class="txt"><div class="ct">' + esc(g.title) + '</div><div class="cid">' + esc(g.title_id) + '</div>' +
-      '<div class="meta"><span class="chip">.' + esc(g.format) + '</span><span class="chip">' + esc(d[0]) + '</span><span class="chip sz">' + gb(g.size_bytes) + '</span></div></div></button>';
+      '<div class="meta"><span class="chip">.' + esc(g.format) + '</span><span class="chip">' + esc(d[0]) + '</span><span class="chip sz">' + gb(g.size_bytes) + '</span>' + eg + '</div></div></button>';
   });
   var fid = document.activeElement && document.activeElement.getAttribute && document.activeElement.getAttribute('data-id');
   grid.innerHTML = h;
@@ -117,9 +122,21 @@ function renderModal() {
   $('mTitle').textContent = g.title;
   var d = DRIVES[g.drive] || [g.drive, ''];
   $('mMeta').innerHTML = '<span class="chip">' + esc(g.title_id) + '</span><span class="chip">.' + esc(g.format) + '</span><span class="chip">' + esc(d[0] + ' ' + d[1]) + '</span><span class="chip">' + gb(g.size_bytes) + '</span>' +
-    (g.compatible === false ? '<span class="chip">Incompatível</span>' : '');
+    (g.compatible === false ? '<span class="chip">Incompatível</span>' : '') +
+    (g.engine && ENGINE_PT[g.engine] ? '<span class="chip">' + esc(ENGINE_PT[g.engine]) + '</span>' : '');
   opts($('mDest'), drives.map(function (x) { var q = DRIVES[x] || [x, '']; return { v: x, n: q[0] + ' ' + q[1], d: x === 'data' ? 'Armazenamento interno' : 'Disco M.2' }; }), S.dest, 'dest');
   opts($('mLevel'), LEVELS.map(function (x) { return { v: x.l, n: x.n, d: x.d }; }), S.level, 'level');
+  $('mDel').setAttribute('aria-checked', S.del ? 'true' : 'false');
+  var kn = $('mKeep');
+  kn.className = 'note' + (S.del ? ' danger' : '');
+  kn.textContent = S.del ? 'A imagem original será apagada depois que a conversão terminar e for verificada.' :
+    'A imagem original é mantida. Teste o jogo antes de apagá-la.';
+  $('mPackAll').setAttribute('aria-checked', S.packAll ? 'true' : 'false');
+  $('mAdvToggle').setAttribute('aria-expanded', S.advOpen ? 'true' : 'false');
+  $('mAdv').hidden = !S.advOpen;
+  var en = $('mEngNote');
+  en.hidden = g.engine !== 'unreal';
+  en.textContent = UNREAL_NOTE;
   var done = $('mDone');
   if (g.converted) { done.hidden = false; done.textContent = 'Já convertido' + (g.dest_path ? ': ' + g.dest_path : '') + '. Reconverter exige que o destino seja removido.'; }
   else done.hidden = true;
@@ -130,6 +147,7 @@ function renderModal() {
 function openModal(id) {
   var g = find(id); if (!g) return;
   S.sel = g; S.opener = document.activeElement; $('mErr').hidden = true;
+  S.del = false; S.advOpen = false; S.packAll = false; $('mLoose').value = '';
   $('modal').hidden = false; renderModal();
   var f = $('mGo'); if (f.disabled) f = $('mCancel'); f.focus();
 }
@@ -143,8 +161,16 @@ function convert() {
     ask('Reconverter ' + g.title + '?', 'Já existe uma versão convertida. O servidor recusa se o destino existir.', 'Reconverter', function () { S.confirmed = true; convert(); });
     return;
   }
+  var keep = $('mLoose').value.replace(/\s+/g, '');
+  if (keep.length > 255 || !KEEP_RE.test(keep)) {
+    var ke = $('mErr'); ke.hidden = false;
+    ke.textContent = 'Avançado: use só letras, números e . _ / , - (até 255 caracteres).';
+    S.advOpen = true; renderModal(); return;
+  }
   S.confirmed = false; S.busy = true; renderModal(); $('mErr').hidden = true;
-  api('POST', '/api/convert', { id: g.id, dest_drive: S.dest, level: S.level }).then(function (r) {
+  var body = { id: g.id, dest_drive: S.dest, level: S.level, delete_source: !!S.del, pack_all: !!S.packAll };
+  if (keep) body.keep_loose = keep;
+  api('POST', '/api/convert', body).then(function (r) {
     S.busy = false;
     if (r && r.ok) { toast('Conversão adicionada à fila.'); closeModal(); poll(); }
     else { var e = $('mErr'); e.hidden = false; e.textContent = (r && r.error) || 'Falha ao iniciar a conversão.'; renderModal(); }
@@ -178,6 +204,21 @@ function renderJob() {
   $('jEta').textContent = c.eta_s > 0 ? 'Restam ' + dur(c.eta_s) : '';
   $('jSize').textContent = c.src_bytes > 0 && c.out_bytes > 0 ?
     gb(c.src_bytes) + ' → ' + gb(c.out_bytes) + ' (−' + Math.max(0, Math.round((1 - c.out_bytes / c.src_bytes) * 100)) + '%)' : '';
+  /* packed/loose_bytes: estimativa do SCAN; auto_loose_bytes: tirados dos pacotes depois, na etapa PACK */
+  var al = c.auto_loose_bytes || 0, pk0 = c.packed_bytes || 0, lo0 = c.loose_bytes || 0;
+  if (al > pk0) al = pk0;
+  var pk = pk0 - al, lo = lo0 + al, tot = pk + lo, info = $('jInfo'), warn = $('jWarn');
+  if (c.engine && tot > 0) {
+    info.hidden = false;
+    info.innerHTML = '<b>' + esc(ENGINE_PT[c.engine] || c.engine) + '</b>' + (c.profile ? ' · perfil <b>' + esc(c.profile) + '</b>' : '') + ' · ' + esc(gb(pk)) + ' em pacotes LZ4 / ' +
+      esc(gb(lo)) + ' soltos' + (al > 0 ? ' (' + esc(gb(al)) + ' sem ganho na amostragem)' : '') + (c.pack_all ? ' · empacotar mesmo sem ganho' : '') +
+      (c.delete_source ? ' · a imagem original será apagada ao final' : '');
+    var lp = Math.round(lo * 100 / tot), notes = [];
+    if (pk < tot * 0.1) notes.push(lp + '% dos dados ficarão fora dos pacotes AMPR (lidos direto do disco).');
+    if (c.engine === 'unreal') notes.push(UNREAL_NOTE);
+    warn.hidden = !notes.length;
+    warn.textContent = notes.join(' ');
+  } else { info.hidden = true; warn.hidden = true; }
 }
 function hres(x) { return x.result || x.stage; } /* servidor envia "result"; mock antigo, "stage" */
 function renderHist() {
@@ -187,6 +228,10 @@ function renderHist() {
     var st = hres(x);
     var r = st === 'done' ? (x.src_bytes ? gb(x.src_bytes) + ' → ' + gb(x.out_bytes) + ' (−' + Math.round((1 - x.out_bytes / x.src_bytes) * 100) + '%)' : 'Concluído') :
       st === 'cancelled' ? 'Cancelado' : (x.error || 'Erro');
+    if (st === 'done' && x.source_deleted) r += ' · original apagado (' + gb(x.freed_bytes || 0) + ' liberados)';
+    else if (st === 'done' && x.warning) r += ' · ' + x.warning;
+    if (x.profile) r = 'perfil ' + x.profile + ' · ' + r;
+    if (x.engine && ENGINE_PT[x.engine] && x.engine !== 'unknown') r = ENGINE_PT[x.engine] + ' · ' + r;
     return '<li><span class="dot ' + esc(st) + '"></span><span class="ht">' + esc(x.title) + '</span><span class="hs">' + esc(r) + '</span></li>';
   }).join('');
 }
@@ -199,8 +244,10 @@ function handleFinished(prev, st) {
       S.seen[x.job] = 1; changed = true;
       var st = hres(x);
       if (st === 'done') {
-        var sv = x.src_bytes ? ' Economia de ' + gb(Math.max(0, x.src_bytes - x.out_bytes)) + ' (−' + Math.round((1 - x.out_bytes / x.src_bytes) * 100) + '%).' : '';
+        var sv = x.src_bytes ? ' ' + gb(x.src_bytes) + ' → ' + gb(x.out_bytes) + '.' : '';
+        if (x.source_deleted) sv += ' Original apagado (' + gb(x.freed_bytes || 0) + ' liberados).';
         toast('Concluído: ' + x.title + '.' + sv);
+        if (x.warning) toast(x.title + ': ' + x.warning, true);
       } else if (st === 'error') toast('Erro em ' + x.title + ': ' + (x.error || 'falha desconhecida'), true);
       else if (st === 'cancelled') toast('Cancelado: ' + x.title, true);
     }
@@ -241,6 +288,16 @@ $('btnRefresh').onclick = function () { loadInfo(); loadGames(); };
 $('histToggle').onclick = function () { S.histOpen = !S.histOpen; this.setAttribute('aria-expanded', S.histOpen); $('histList').hidden = !S.histOpen; };
 $('mClose').onclick = $('mCancel').onclick = $('scrim').onclick = closeModal;
 $('mGo').onclick = convert;
+$('mAdvToggle').onclick = function () { S.advOpen = !S.advOpen; renderModal(); if (S.advOpen) $('mLoose').focus(); };
+$('mPackAll').onclick = function () { S.packAll = !S.packAll; renderModal(); };
+$('mDel').onclick = function () {
+  var g = S.sel; if (!g) return;
+  if (S.del) { S.del = false; renderModal(); return; }
+  /* ask() foca "Voltar": confirmar nunca é o foco padrão */
+  ask('Apagar a imagem original?', 'Arquivo: ' + (g.image_path || '(caminho desconhecido)') +
+    '\n\nIsso não pode ser desfeito. Recomendado só depois de testar um jogo convertido.', 'Apagar depois de converter',
+    function () { S.del = true; renderModal(); });
+};
 $('cNo').onclick = closeAsk;
 $('cYes').onclick = function () { var f = S.askFn; closeAsk(); if (f) f(); };
 $('jCancel').onclick = function () {
@@ -253,7 +310,7 @@ $('jCancel').onclick = function () {
 /* navegação espacial por setas */
 function scope() { return !$('confirm').hidden ? $('confirm') : !$('modal').hidden ? $('modal') : document; }
 function focusables() {
-  var all = scope().querySelectorAll('button:not([disabled])'), out = [];
+  var all = scope().querySelectorAll('button:not([disabled]), input:not([disabled])'), out = [];
   for (var i = 0; i < all.length; i++) { var r = all[i].getBoundingClientRect(); if (r.width > 0 && r.height > 0) out.push(all[i]); }
   return out;
 }
@@ -276,6 +333,8 @@ function move(dir) {
 }
 document.addEventListener('keydown', function (e) {
   var k = e.keyCode;
+  var inField = document.activeElement && document.activeElement.tagName === 'INPUT';
+  if (inField && (k === 37 || k === 39 || k === 8)) return; /* setas laterais e backspace editam o campo */
   if (k >= 37 && k <= 40) { e.preventDefault(); move(['l', 'u', 'r', 'd'][k - 37]); }
   else if (k === 27 || k === 8 || k === 461) {
     if (!$('confirm').hidden) { e.preventDefault(); closeAsk(); }
