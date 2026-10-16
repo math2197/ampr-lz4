@@ -1,0 +1,10 @@
+.DS_Store
+*.elf
+*.o
+*.dSYM/
+__pycache__/
+build/
+tests/build/
+src/ui_assets.h
+src/icon_asset.h
+src/ampr_sprx_asset.h

@@ -1,0 +1,6 @@
+Arquivos de referência copiados sem modificação de https://github.com/drakmor/ampr_emu (branch main,
+baixados em 2026-10-15 via raw.githubusercontent.com):
+  tools/ampr_pack_format.py, tools/ampr_pack.py, tools/build_ampr_index.py,
+  docs/ASSET_PACKS.md, src/ampr_emu_index.cpp, src/ampr_emu_pack_core.cpp, LICENSE
+Licença: GNU GPL-3.0 (ver LICENSE neste diretório). Usados só como fonte normativa do formato
+e pelo validador tests/validate_ampr.py.

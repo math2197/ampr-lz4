@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0b0f1a">
+<title>AMPR·LZ4</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="8" fill="#0070d1"/><path d="M9 21l5-10 3 6 2-3 4 7" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div><h1>AMPR<span>·</span>LZ4</h1><small id="ver">v—</small></div>
+  </div>
+  <div class="top-right">
+    <span id="smp" class="pill pill-muted">ShadowMountPlus…</span>
+    <button id="btnRefresh" class="btn btn-ghost" type="button" aria-label="Atualizar lista">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Atualizar</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <div class="bar">
+    <div class="filters" role="group" aria-label="Filtro">
+      <button type="button" class="chipbtn on" data-f="all">Todos <b id="cAll">0</b></button>
+      <button type="button" class="chipbtn" data-f="todo">Não convertidos <b id="cTodo">0</b></button>
+      <button type="button" class="chipbtn" data-f="done">Convertidos <b id="cDone">0</b></button>
+    </div>
+  </div>
+  <div id="state" class="state" hidden></div>
+  <div id="grid" class="grid"></div>
+
+  <section class="hist" id="hist" hidden>
+    <button type="button" id="histToggle" class="histhead" aria-expanded="false">
+      <span>Histórico recente</span>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <ul id="histList" hidden></ul>
+  </section>
+</main>
+
+<div id="toasts" aria-live="polite"></div>
+
+<div id="modal" class="modal" hidden>
+  <div class="scrim" id="scrim"></div>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="mTitle">
+    <button type="button" class="close" id="mClose" aria-label="Fechar">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg>
+    </button>
+    <div class="sheet-body">
+      <div class="cover big" id="mCover"></div>
+      <div class="sheet-info">
+        <h2 id="mTitle"></h2>
+        <div class="meta" id="mMeta"></div>
+        <div id="mDone" class="note ok" hidden></div>
+        <div id="mDestWrap">
+          <h3>Destino</h3>
+          <div class="opts" id="mDest" role="radiogroup" aria-label="Destino"></div>
+        </div>
+        <h3>Compressão</h3>
+        <div class="opts lv" id="mLevel" role="radiogroup" aria-label="Compressão"></div>
+        <p class="note">A imagem original é mantida. Teste o jogo antes de apagá-la.</p>
+        <div id="mErr" class="note err" hidden></div>
+        <div class="actions">
+          <button type="button" class="btn btn-primary" id="mGo">Converter</button>
+          <button type="button" class="btn btn-ghost" id="mCancel">Fechar</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="confirm" class="modal" hidden>
+  <div class="scrim"></div>
+  <div class="sheet small" role="alertdialog" aria-modal="true" aria-labelledby="cTitle">
+    <h2 id="cTitle"></h2>
+    <p id="cText" class="note"></p>
+    <div class="actions">
+      <button type="button" class="btn btn-danger" id="cYes">Confirmar</button>
+      <button type="button" class="btn btn-ghost" id="cNo">Voltar</button>
+    </div>
+  </div>
+</div>
+
+<footer id="job" class="job" hidden>
+  <div class="job-top">
+    <div class="job-title"><span class="spin" aria-hidden="true"></span><b id="jTitle"></b><em id="jQueue"></em></div>
+    <button type="button" class="btn btn-danger sm" id="jCancel">Cancelar</button>
+  </div>
+  <ol class="steps" id="jSteps"></ol>
+  <div class="pbar"><i id="jBar"></i></div>
+  <div class="job-stats">
+    <span id="jStage" class="stage"></span>
+    <span id="jPct"></span>
+    <span id="jSpeed"></span>
+    <span id="jEta"></span>
+    <span id="jSize"></span>
+  </div>
+</footer>
+<script src="/app.js"></script>
+</body>
+</html>

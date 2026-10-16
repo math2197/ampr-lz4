@@ -1,0 +1,11 @@
+libSceAmpr.sprx - emulador AMPR (ampr_emu) embutido no ampr-lz4.elf
+
+Origem:  https://github.com/drakmor/ampr_emu/releases/download/0.4.2.1/libSceAmpr.sprx
+Projeto: https://github.com/drakmor/ampr_emu (autor: Drakmor)
+Versão:  0.4.2.1 (string interna "0.4.2.1 (c) Drakmor"; suporta AMPRIDX3, AMPRPAK4, AMPRDAT3)
+Licença: GPL-3.0 (a mesma deste projeto); código-fonte no repositório acima.
+Tamanho: 423350 bytes
+SHA-256: 69e6c4d5e4f5fb83c9e01815db5861c4c75734acbf4595cafa50d4c218116d1a
+
+Arquivo redistribuído sem modificação. Para atualizar: baixe a nova release, substitua
+assets/libSceAmpr.sprx, atualize este arquivo e rode `make` (o Makefile gera src/ampr_sprx_asset.h).

@@ -1,0 +1,2 @@
+lz4.c, lz4.h, lz4hc.c, lz4hc.h e LICENSE da tag v1.10.0 de https://github.com/lz4/lz4 (pasta lib/),
+sem modificações. Licença BSD-2-Clause (ver LICENSE).
